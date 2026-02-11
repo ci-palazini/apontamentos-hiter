@@ -47,7 +47,7 @@ export function SlideFactory({ dias }: { dias: FactoryDayRow[] }) {
                             {dias.map((d, i) => <Cell key={i} fill={(d.meta > 0 && d.produzido >= d.meta) ? '#16a34a' : (d.isSaturday ? '#3b82f6' : '#f97316')} />)}
                             <LabelList dataKey="produzido" content={<FactoryBarLabel />} />
                         </Bar>
-                        <Line type="monotone" dataKey="meta" stroke="#1f2937" strokeDasharray="5 5" dot={false} strokeWidth={3} />
+                        <Line type="monotone" dataKey="metaDisplay" stroke="#1f2937" strokeDasharray="5 5" dot={false} strokeWidth={3} />
                     </ComposedChart>
                 </ResponsiveContainer>
             </div>

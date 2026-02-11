@@ -10,7 +10,7 @@ import {
 } from '../../../services/db';
 import { supabase } from '../../../lib/supabaseClient';
 import { fracDiaLogico } from '../../../utils/time';
-import type { FactoryDayRow, CentroPerf, Contribuinte } from '../types';
+import type { FactoryDayRow } from '../types';
 import {
     getNow,
     startOfDayLocal,
@@ -246,7 +246,9 @@ export function useTvData(empresaId: number, scope: string | undefined) {
 
                 const prod = +(historyAgregadoGlobal.get(iso) ?? 0).toFixed(2);
                 const pct = metaDoDia > 0 ? (prod / metaDoDia) * 100 : (prod > 0 ? 100 : 0);
-                serieFactory.push({ iso, label: shortBR(iso), produzido: prod, meta: metaDoDia, pct, isSaturday: isSat });
+                // metaDisplay: usa gaps (undefined) no sábado para a linha "sumir" visualmente
+                const metaDisplay = isSat ? undefined : metaTotalStandard;
+                serieFactory.push({ iso, label: shortBR(iso), produzido: prod, meta: metaDoDia, metaDisplay, pct, isSaturday: isSat });
             }
 
             if (!cancelledRef.current) { setFactoryDays(serieFactory); setCentrosPerf(perfCalculada); }

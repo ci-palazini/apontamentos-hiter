@@ -6,7 +6,7 @@ import {
 } from '@mantine/core';
 import {
   IconChevronLeft, IconChevronRight, IconMaximize, IconMinimize, IconTrendingUp,
-  IconClock, IconArrowLeft, IconX, IconCalendar // Adicionado IconCalendar
+  IconClock, IconArrowLeft, IconX, IconCalendar, IconCloudUpload // Adicionado IconCloudUpload
 } from '@tabler/icons-react';
 
 import { useEmpresaId } from '../../contexts/TenantContext';
@@ -264,7 +264,24 @@ export default function TvDashboardPage() {
                   <Stack gap={0}>
                     <Text size="xs" c="dimmed" fw={700} tt="uppercase">Visão de</Text>
                     <Text size="lg" fw={900} c="dark" style={{ lineHeight: 1.1 }}>{dataReferenciaText}</Text>
-                    <Text size="10px" c="dimmed">Atualizado: {lastUpdateText}</Text>
+                  </Stack>
+                </Group>
+              </Card>
+
+              {/* --- NOVO CARD: Último Upload --- */}
+              <Card padding="sm" radius="md" withBorder shadow="sm" bg="white">
+                <Group gap="sm">
+                  <ThemeIcon
+                    size="lg"
+                    radius="xl"
+                    color="blue"
+                    variant="light"
+                  >
+                    <IconCloudUpload size={20} />
+                  </ThemeIcon>
+                  <Stack gap={0}>
+                    <Text size="xs" c="dimmed" fw={700} tt="uppercase">Última Atualização</Text>
+                    <Text size="md" fw={900} c="dark" style={{ lineHeight: 1.1 }}>{lastUpdateText}</Text>
                   </Stack>
                 </Group>
               </Card>

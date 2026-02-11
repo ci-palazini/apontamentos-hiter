@@ -1,4 +1,4 @@
-export type FactoryDayRow = { iso: string; label: string; produzido: number; meta: number; pct: number; isSaturday: boolean; };
+export type FactoryDayRow = { iso: string; label: string; produzido: number; meta: number; metaDisplay?: number; pct: number; isSaturday: boolean; };
 export type Contribuinte = { codigo: string; real: number; is_stale: boolean; last_ref: string; };
 
 export type CentroPerf = {
