@@ -1,11 +1,14 @@
 //src/services/funcionarios.ts
 import { supabase } from '../lib/supabaseClient';
 
+export type AreaFuncionario = 'Montagem' | 'Pintura' | 'Usinagem';
+
 export type FuncionarioMeta = {
     id: number;
     matricula: string;
     nome: string;
     meta_diaria_horas: number;
+    area: AreaFuncionario | null;
     ativo: boolean;
 };
 
@@ -90,7 +93,7 @@ export async function fetchFuncionarioCentroRange(
 export async function fetchFuncionariosMeta(empresaId: number): Promise<FuncionarioMeta[]> {
     const { data, error } = await supabase
         .from('funcionarios_meta')
-        .select('id, matricula, nome, meta_diaria_horas, ativo')
+        .select('id, matricula, nome, meta_diaria_horas, area, ativo')
         .eq('empresa_id', empresaId)
         .order('matricula', { ascending: true });
 
@@ -103,11 +106,13 @@ export async function upsertFuncionarioMeta(empresaId: number, payload: {
     matricula: string;
     nome: string;
     meta_diaria_horas: number;
+    area?: AreaFuncionario | null;
     ativo?: boolean;
 }): Promise<void> {
     const row = {
         ...payload,
         empresa_id: empresaId,
+        area: payload.area ?? null,
         ativo: payload.ativo ?? true,
     };
 
@@ -139,4 +144,99 @@ export async function fetchFuncionariosMes(empresaId: number, anoMesISO: string)
 
     if (error) throw error;
     return (data ?? []) as FuncionarioMes[];
+}
+
+/* =========================================================================
+   Vínculos Funcionário ↔ Centro (máquina)
+   ========================================================================= */
+
+export type FuncionarioCentro = {
+    id: number;
+    funcionario_meta_id: number;
+    centro_id: number;
+    empresa_id: number;
+};
+
+export type FuncionarioComCentros = FuncionarioMeta & {
+    centros: number[];  // array de centro_ids vinculados
+};
+
+/** Busca todos os vínculos funcionário-centro da empresa */
+export async function fetchFuncionarioCentros(empresaId: number): Promise<FuncionarioCentro[]> {
+    const { data, error } = await supabase
+        .from('funcionario_centros')
+        .select('id, funcionario_meta_id, centro_id, empresa_id')
+        .eq('empresa_id', empresaId);
+    if (error) throw error;
+    return (data ?? []) as FuncionarioCentro[];
+}
+
+/** Adiciona um vínculo funcionário → centro */
+export async function addFuncionarioCentro(
+    empresaId: number,
+    funcMetaId: number,
+    centroId: number
+): Promise<void> {
+    const { error } = await supabase
+        .from('funcionario_centros')
+        .insert({ funcionario_meta_id: funcMetaId, centro_id: centroId, empresa_id: empresaId });
+    if (error) throw error;
+}
+
+/** Remove um vínculo pelo ID */
+export async function removeFuncionarioCentro(id: number): Promise<void> {
+    const { error } = await supabase
+        .from('funcionario_centros')
+        .delete()
+        .eq('id', id);
+    if (error) throw error;
+}
+
+/** Define os centros de um funcionário (remove todos e insere novos) */
+export async function setFuncionarioCentros(
+    empresaId: number,
+    funcMetaId: number,
+    centroIds: number[]
+): Promise<void> {
+    // Remove vínculos existentes
+    const { error: delErr } = await supabase
+        .from('funcionario_centros')
+        .delete()
+        .eq('funcionario_meta_id', funcMetaId)
+        .eq('empresa_id', empresaId);
+    if (delErr) throw delErr;
+
+    // Insere novos
+    if (centroIds.length > 0) {
+        const rows = centroIds.map(cid => ({
+            funcionario_meta_id: funcMetaId,
+            centro_id: cid,
+            empresa_id: empresaId,
+        }));
+        const { error: insErr } = await supabase
+            .from('funcionario_centros')
+            .insert(rows);
+        if (insErr) throw insErr;
+    }
+}
+
+/** Retorna todos os funcionários com seus centros vinculados */
+export async function fetchFuncionariosComCentros(empresaId: number): Promise<FuncionarioComCentros[]> {
+    const [metas, vinculos] = await Promise.all([
+        fetchFuncionariosMeta(empresaId),
+        fetchFuncionarioCentros(empresaId),
+    ]);
+
+    // Agrupa centros por funcionario_meta_id
+    const centrosByFunc = new Map<number, number[]>();
+    for (const v of vinculos) {
+        const arr = centrosByFunc.get(v.funcionario_meta_id) ?? [];
+        arr.push(v.centro_id);
+        centrosByFunc.set(v.funcionario_meta_id, arr);
+    }
+
+    return metas.map(m => ({
+        ...m,
+        centros: centrosByFunc.get(m.id) ?? [],
+    }));
 }

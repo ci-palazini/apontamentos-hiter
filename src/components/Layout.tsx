@@ -7,7 +7,6 @@ import {
   IconChartHistogram,
   IconUpload,
   IconSettings,
-  IconUsers,
   IconGauge,
   IconDeviceTv,
   IconSpeakerphone,
@@ -43,13 +42,6 @@ const links: LinkItem[] = [
     to: '/graficos',
     icon: <IconChartHistogram size={16} />,
     exact: true,
-  },
-  {
-    label: 'Colaboradores',
-    to: '/colaboradores',
-    icon: <IconUsers size={16} />,
-    exact: true,
-    empresaOnly: 1, // Apenas Spirax Sarco
   },
   {
     label: 'Rendimento',

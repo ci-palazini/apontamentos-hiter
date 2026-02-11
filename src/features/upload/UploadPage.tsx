@@ -6,7 +6,10 @@ import { parsePtBrNumber, excelSerialToISODate } from '../../utils/normalization
 import * as XLSX from 'xlsx';
 import { Dropzone, MIME_TYPES } from '@mantine/dropzone';
 import { notifications } from '@mantine/notifications';
-import { Title, Card, Grid, Text, Table, Group, Button, Badge, Divider, Loader } from '@mantine/core';
+import {
+  Title, Card, Grid, Text, Table, Group, Button, Badge, Divider, Loader,
+  Modal, TextInput, MultiSelect, Stack, Checkbox, Select
+} from '@mantine/core';
 import { DateInput } from '@mantine/dates';
 import { useEmpresaId } from '../../contexts/TenantContext';
 import {
@@ -16,6 +19,13 @@ import {
   fetchEstadoAnterior,
   type VUploadDia
 } from '../../services/db';
+import {
+  fetchFuncionariosMeta,
+  fetchFuncionarioCentros,
+  upsertFuncionarioMeta,
+  setFuncionarioCentros,
+  type FuncionarioMeta
+} from '../../services/funcionarios';
 
 /* ==========================
    Tipos Locais
@@ -33,6 +43,33 @@ type ParsedRow = {
 };
 
 type UploadError = { tipo: 'sheet' | 'header' | 'row' | 'meta' | 'persist'; mensagem: string };
+
+// Estado do cadastro rápido de funcionários
+type PendingRegistration = {
+  matricula: string;
+  nome: string;
+  centros: string[];  // centro_ids como strings para MultiSelect
+};
+
+// Estado de conflitos de realocação
+type ReallocationConflict = {
+  matricula: string;
+  nome: string;
+  centroCsvId: number;
+  centroCsvCodigo: string;
+  centrosVinculados: { id: number; codigo: string }[];
+  selectedCentroId: number;    // centro sugerido/selecionado
+  aceitar: boolean;            // se o usuário aceita a realocação
+};
+
+// Dados pendentes entre etapas do upload
+type PendingUpload = {
+  file: File;
+  rows: ParsedRow[];
+  groups: Map<string, ParsedRow[]>;
+  mapping: { centrosById: Map<number, Centro>; aliasIndex: Map<string, number> };
+  avisos: string[];
+};
 
 /* ==========================
    Utils
@@ -153,6 +190,18 @@ export default function UploadPage() {
   const [uploadsDia, setUploadsDia] = useState<VUploadDia[]>([]);
   const [loadingUploads, setLoadingUploads] = useState(false);
   const nav = useNavigate();
+
+  // --- Estados dos modais de pré-processamento ---
+  const [pendingUpload, setPendingUpload] = useState<PendingUpload | null>(null);
+
+  // Modal 1: Cadastro rápido de funcionários
+  const [showRegistrationModal, setShowRegistrationModal] = useState(false);
+  const [pendingRegistrations, setPendingRegistrations] = useState<PendingRegistration[]>([]);
+  const [centroOptions, setCentroOptions] = useState<{ value: string; label: string }[]>([]);
+
+  // Modal 2: Realocação de máquinas
+  const [showReallocationModal, setShowReallocationModal] = useState(false);
+  const [reallocationConflicts, setReallocationConflicts] = useState<ReallocationConflict[]>([]);
 
   const pushLog = (s: string) => setLog((prev) => [...prev, s]);
 
@@ -529,7 +578,7 @@ export default function UploadPage() {
   };
 
   /* ==========================
-     onDrop
+     onDrop - FLUXO PRINCIPAL
   ========================== */
   const onDrop = useCallback(async (files: File[]) => {
     if (!files.length) return;
@@ -559,6 +608,139 @@ export default function UploadPage() {
       const groups = groupByDate(rows);
       pushLog(`Detectadas ${groups.size} data(s): ${[...groups.keys()].join(', ')}`);
 
+      // --- Preparar opções de centros para modais ---
+      const opts = [...mapping.centrosById.values()].map(c => ({ value: String(c.id), label: c.codigo }));
+      setCentroOptions(opts);
+
+      // --- ETAPA 1: Verificar matrículas não cadastradas ---
+      const matriculasUnicas = new Set<string>();
+      for (const r of rows) {
+        if (r.matricula) matriculasUnicas.add(r.matricula);
+      }
+
+      if (matriculasUnicas.size > 0) {
+        pushLog('Verificando matrículas cadastradas...');
+        const metasExistentes = await fetchFuncionariosMeta(empresaId);
+        const matriculasCadastradas = new Set(metasExistentes.map(m => m.matricula));
+        const novas = [...matriculasUnicas].filter(m => !matriculasCadastradas.has(m));
+
+        if (novas.length > 0) {
+          pushLog(`⚠️ ${novas.length} matrícula(s) não cadastrada(s): ${novas.join(', ')}`);
+          pushLog('Aguardando cadastro dos funcionários...');
+
+          // Salvar estado para continuar depois
+          setPendingUpload({ file, rows, groups, mapping, avisos });
+          setPendingRegistrations(novas.map(m => ({ matricula: m, nome: '', centros: [] })));
+          setShowRegistrationModal(true);
+          setBusy(false);
+          return; // Pausa aqui, fluxo continua no callback do modal
+        }
+      }
+
+      // Se não houver matrículas novas, ir direto para etapa 2
+      await etapa2VerificarRealocacao(file, rows, groups, mapping);
+
+    } catch (err: any) {
+      console.error(err);
+      const tipo = (err?.tipo as UploadError['tipo']) ?? 'persist';
+      const mensagem = err?.mensagem ?? err?.message ?? 'Erro desconhecido ao processar o upload.';
+      pushLog(`Erro (${tipo}): ${mensagem}`);
+      notifications.show({ title: 'Falha no upload', message: mensagem, color: 'red' });
+      setBusy(false);
+    }
+  }, [dia, refetchUploads]);
+
+  /* ==========================
+     ETAPA 2: Verificar Realocação
+  ========================== */
+  const etapa2VerificarRealocacao = async (
+    file: File,
+    rows: ParsedRow[],
+    groups: Map<string, ParsedRow[]>,
+    mapping: { centrosById: Map<number, Centro>; aliasIndex: Map<string, number> }
+  ) => {
+    try {
+      // Carregar vínculos atualizados
+      const [metas, vinculos] = await Promise.all([
+        fetchFuncionariosMeta(empresaId),
+        fetchFuncionarioCentros(empresaId),
+      ]);
+
+      // Montar mapa de matrícula -> centros vinculados
+      const metaByMatricula = new Map<string, FuncionarioMeta>();
+      for (const m of metas) metaByMatricula.set(m.matricula, m);
+
+      const centrosByFuncId = new Map<number, number[]>();
+      for (const v of vinculos) {
+        const arr = centrosByFuncId.get(v.funcionario_meta_id) ?? [];
+        arr.push(v.centro_id);
+        centrosByFuncId.set(v.funcionario_meta_id, arr);
+      }
+
+      // Detectar conflitos (agrupar por matrícula + centro_csv)
+      const conflictMap = new Map<string, ReallocationConflict>();
+
+      for (const r of rows) {
+        if (!r.matricula) continue;
+        const meta = metaByMatricula.get(r.matricula);
+        if (!meta) continue; // sem cadastro = sem vínculo
+
+        const funcCentros = centrosByFuncId.get(meta.id) ?? [];
+        if (funcCentros.length === 0) continue; // sem vínculos = não realocar
+
+        if (funcCentros.includes(r.centro_id)) continue; // OK, máquina está na lista
+
+        // Conflito!
+        const key = `${r.matricula}|${r.centro_id}`;
+        if (!conflictMap.has(key)) {
+          const centrosVinc = funcCentros.map(cid => ({
+            id: cid,
+            codigo: mapping.centrosById.get(cid)?.codigo ?? `ID ${cid}`,
+          }));
+          const csvCodigo = mapping.centrosById.get(r.centro_id)?.codigo ?? `ID ${r.centro_id}`;
+
+          conflictMap.set(key, {
+            matricula: r.matricula,
+            nome: meta.nome,
+            centroCsvId: r.centro_id,
+            centroCsvCodigo: csvCodigo,
+            centrosVinculados: centrosVinc,
+            selectedCentroId: centrosVinc[0]?.id ?? r.centro_id,
+            aceitar: true,
+          });
+        }
+      }
+
+      if (conflictMap.size > 0) {
+        pushLog(`⚠️ ${conflictMap.size} conflito(s) de máquina detectado(s). Aguardando decisão...`);
+        setPendingUpload({ file, rows, groups, mapping, avisos: [] });
+        setReallocationConflicts([...conflictMap.values()]);
+        setShowReallocationModal(true);
+        setBusy(false);
+        return;
+      }
+
+      // Sem conflitos, persistir direto
+      await etapa3Persistir(file, rows, groups);
+
+    } catch (err: any) {
+      console.error(err);
+      pushLog(`Erro na verificação de realocação: ${err?.message ?? err}`);
+      notifications.show({ title: 'Erro', message: err?.message ?? 'Erro desconhecido', color: 'red' });
+      setBusy(false);
+    }
+  };
+
+  /* ==========================
+     ETAPA 3: Persistir
+  ========================== */
+  const etapa3Persistir = async (
+    file: File,
+    _rows: ParsedRow[],
+    groups: Map<string, ParsedRow[]>
+  ) => {
+    setBusy(true);
+    try {
       for (const [dataISO, rowsDia] of groups.entries()) {
         pushLog(`\n=== Dia ${dataISO} ===`);
         try {
@@ -570,7 +752,6 @@ export default function UploadPage() {
           pushLog(`Upload ${uploadId} criado para ${dataISO}.`);
 
           pushLog('Calculando totais (verificando estagnação de dados)...');
-          // Passamos a dataISO para que ele busque o upload anterior DESTE dia
           await salvarTotais(rowsDia, uploadId, dataISO);
           pushLog('Totais salvos.');
 
@@ -597,14 +778,119 @@ export default function UploadPage() {
 
     } catch (err: any) {
       console.error(err);
-      const tipo = (err?.tipo as UploadError['tipo']) ?? 'persist';
       const mensagem = err?.mensagem ?? err?.message ?? 'Erro desconhecido ao processar o upload.';
-      pushLog(`Erro (${tipo}): ${mensagem}`);
+      pushLog(`Erro: ${mensagem}`);
       notifications.show({ title: 'Falha no upload', message: mensagem, color: 'red' });
     } finally {
       setBusy(false);
+      setPendingUpload(null);
     }
-  }, [dia, refetchUploads]);
+  };
+
+  /* ==========================
+     Callbacks dos modais
+  ========================== */
+
+  // Modal 1: Cadastro rápido concluído
+  const onRegistrationComplete = async () => {
+    setShowRegistrationModal(false);
+    setBusy(true);
+
+    try {
+      // Salvar todos os funcionários novos
+      for (const reg of pendingRegistrations) {
+        if (!reg.nome.trim()) {
+          pushLog(`⚠️ Matrícula ${reg.matricula}: nome não preenchido, pulando...`);
+          continue;
+        }
+        await upsertFuncionarioMeta(empresaId, {
+          matricula: reg.matricula,
+          nome: reg.nome.trim(),
+          meta_diaria_horas: 8,
+          ativo: true,
+        });
+
+        // Buscar ID recém-criado para vincular centros
+        if (reg.centros.length > 0) {
+          const { data: metaRow } = await supabase
+            .from('funcionarios_meta')
+            .select('id')
+            .eq('empresa_id', empresaId)
+            .eq('matricula', reg.matricula)
+            .single();
+
+          if (metaRow) {
+            await setFuncionarioCentros(empresaId, metaRow.id, reg.centros.map(Number));
+          }
+        }
+
+        pushLog(`✅ Funcionário ${reg.matricula} (${reg.nome}) cadastrado.`);
+      }
+
+      // Continuar com etapa 2
+      if (pendingUpload) {
+        await etapa2VerificarRealocacao(
+          pendingUpload.file,
+          pendingUpload.rows,
+          pendingUpload.groups,
+          pendingUpload.mapping
+        );
+      }
+    } catch (err: any) {
+      console.error(err);
+      pushLog(`Erro ao cadastrar funcionários: ${err?.message ?? err}`);
+      notifications.show({ title: 'Erro', message: err?.message ?? 'Erro', color: 'red' });
+      setBusy(false);
+    }
+  };
+
+  // Modal 2: Realocação concluída
+  const onReallocationComplete = async () => {
+    setShowReallocationModal(false);
+    if (!pendingUpload) return;
+    setBusy(true);
+
+    try {
+      // Aplicar realocações aceitas
+      const realocMap = new Map<string, number>(); // key: "matricula|centroCsvId" -> novo centroId
+      for (const c of reallocationConflicts) {
+        if (c.aceitar) {
+          realocMap.set(`${c.matricula}|${c.centroCsvId}`, c.selectedCentroId);
+          pushLog(`🔀 Realocando: ${c.matricula} (${c.nome}) de ${c.centroCsvCodigo} → ${pendingUpload.mapping.centrosById.get(c.selectedCentroId)?.codigo ?? c.selectedCentroId}`);
+        }
+      }
+
+      // Aplicar nas rows
+      const rowsModificadas = pendingUpload.rows.map(r => {
+        if (!r.matricula) return r;
+        const key = `${r.matricula}|${r.centro_id}`;
+        const novoCentro = realocMap.get(key);
+        if (novoCentro !== undefined) {
+          return { ...r, centro_id: novoCentro };
+        }
+        return r;
+      });
+
+      // Reagrupar por data
+      const newGroups = groupByDate(rowsModificadas);
+
+      await etapa3Persistir(pendingUpload.file, rowsModificadas, newGroups);
+
+    } catch (err: any) {
+      console.error(err);
+      pushLog(`Erro ao aplicar realocações: ${err?.message ?? err}`);
+      notifications.show({ title: 'Erro', message: err?.message ?? 'Erro', color: 'red' });
+      setBusy(false);
+    }
+  };
+
+  // Modal 2: Manter tudo original
+  const onReallocationSkip = async () => {
+    setShowReallocationModal(false);
+    if (!pendingUpload) return;
+    pushLog('Realocações ignoradas. Mantendo dados originais do CSV.');
+    await etapa3Persistir(pendingUpload.file, pendingUpload.rows, pendingUpload.groups);
+  };
 
   /* ==========================
      Render
@@ -781,6 +1067,156 @@ export default function UploadPage() {
           </Card>
         </Grid.Col>
       </Grid>
+
+      {/* ===== MODAL 1: Cadastro Rápido de Funcionários ===== */}
+      <Modal
+        opened={showRegistrationModal}
+        onClose={() => { setShowRegistrationModal(false); setPendingUpload(null); }}
+        title={<Text fw={700} size="lg">👤 Cadastro de Funcionários</Text>}
+        size="xl"
+        closeOnClickOutside={false}
+      >
+        <Stack gap="md">
+          <Text size="sm" c="dimmed">
+            As seguintes matrículas foram encontradas no CSV mas não estão cadastradas.
+            Preencha o nome e selecione as máquinas vinculadas a cada funcionário.
+          </Text>
+
+          <Table withTableBorder highlightOnHover>
+            <Table.Thead>
+              <Table.Tr>
+                <Table.Th w={100}>Matrícula</Table.Th>
+                <Table.Th>Nome</Table.Th>
+                <Table.Th>Máquinas</Table.Th>
+              </Table.Tr>
+            </Table.Thead>
+            <Table.Tbody>
+              {pendingRegistrations.map((reg, idx) => (
+                <Table.Tr key={reg.matricula}>
+                  <Table.Td>
+                    <Text fw={700} ff="monospace">{reg.matricula}</Text>
+                  </Table.Td>
+                  <Table.Td>
+                    <TextInput
+                      placeholder="Nome do funcionário"
+                      value={reg.nome}
+                      onChange={e => {
+                        const arr = [...pendingRegistrations];
+                        arr[idx] = { ...arr[idx], nome: e.currentTarget.value };
+                        setPendingRegistrations(arr);
+                      }}
+                      size="sm"
+                      required
+                    />
+                  </Table.Td>
+                  <Table.Td>
+                    <MultiSelect
+                      placeholder="Selecione máquinas..."
+                      data={centroOptions}
+                      value={reg.centros}
+                      onChange={val => {
+                        const arr = [...pendingRegistrations];
+                        arr[idx] = { ...arr[idx], centros: val };
+                        setPendingRegistrations(arr);
+                      }}
+                      searchable
+                      size="sm"
+                    />
+                  </Table.Td>
+                </Table.Tr>
+              ))}
+            </Table.Tbody>
+          </Table>
+
+          <Group justify="flex-end">
+            <Button variant="default" onClick={() => { setShowRegistrationModal(false); setPendingUpload(null); }}>
+              Cancelar Upload
+            </Button>
+            <Button
+              onClick={onRegistrationComplete}
+              disabled={pendingRegistrations.some(r => !r.nome.trim())}
+            >
+              Cadastrar e Continuar
+            </Button>
+          </Group>
+        </Stack>
+      </Modal>
+
+      {/* ===== MODAL 2: Realocação de Máquinas ===== */}
+      <Modal
+        opened={showReallocationModal}
+        onClose={() => { setShowReallocationModal(false); setPendingUpload(null); }}
+        title={<Text fw={700} size="lg">⚠️ Realocação de Horas</Text>}
+        size="xl"
+        closeOnClickOutside={false}
+      >
+        <Stack gap="md">
+          <Text size="sm" c="dimmed">
+            As seguintes linhas apontam horas em máquinas que <strong>não estão vinculadas</strong> ao
+            funcionário. Marque quais deseja realocar para a máquina correta.
+          </Text>
+
+          <Table withTableBorder highlightOnHover>
+            <Table.Thead>
+              <Table.Tr>
+                <Table.Th w={60}>Aceitar</Table.Th>
+                <Table.Th w={90}>Matrícula</Table.Th>
+                <Table.Th>Nome</Table.Th>
+                <Table.Th>Máquina CSV</Table.Th>
+                <Table.Th>Realocar para</Table.Th>
+              </Table.Tr>
+            </Table.Thead>
+            <Table.Tbody>
+              {reallocationConflicts.map((c, idx) => (
+                <Table.Tr key={`${c.matricula}-${c.centroCsvId}`} bg={c.aceitar ? 'var(--mantine-color-yellow-0)' : undefined}>
+                  <Table.Td>
+                    <Checkbox
+                      checked={c.aceitar}
+                      onChange={e => {
+                        const arr = [...reallocationConflicts];
+                        arr[idx] = { ...arr[idx], aceitar: e.currentTarget.checked };
+                        setReallocationConflicts(arr);
+                      }}
+                    />
+                  </Table.Td>
+                  <Table.Td><Text ff="monospace" fw={600}>{c.matricula}</Text></Table.Td>
+                  <Table.Td>{c.nome}</Table.Td>
+                  <Table.Td>
+                    <Badge color="red" variant="light">{c.centroCsvCodigo}</Badge>
+                  </Table.Td>
+                  <Table.Td>
+                    {c.centrosVinculados.length === 1 ? (
+                      <Badge color="green" variant="light">{c.centrosVinculados[0].codigo}</Badge>
+                    ) : (
+                      <Select
+                        data={c.centrosVinculados.map(cv => ({ value: String(cv.id), label: cv.codigo }))}
+                        value={String(c.selectedCentroId)}
+                        onChange={val => {
+                          if (!val) return;
+                          const arr = [...reallocationConflicts];
+                          arr[idx] = { ...arr[idx], selectedCentroId: Number(val) };
+                          setReallocationConflicts(arr);
+                        }}
+                        size="sm"
+                        disabled={!c.aceitar}
+                      />
+                    )}
+                  </Table.Td>
+                </Table.Tr>
+              ))}
+            </Table.Tbody>
+          </Table>
+
+          <Group justify="flex-end">
+            <Button variant="default" onClick={onReallocationSkip}>
+              Manter Tudo Original
+            </Button>
+            <Button color="yellow" onClick={onReallocationComplete}>
+              Aplicar Realocações Selecionadas
+            </Button>
+          </Group>
+        </Stack>
+      </Modal>
     </div>
   );
 }

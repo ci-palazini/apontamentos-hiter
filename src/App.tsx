@@ -6,7 +6,6 @@ import GraficosPage from './features/graficos/GraficosPage';
 import UploadDetalhePage from './features/upload/UploadDetalhePage';
 import ConfigGeralPage from './features/config/ConfigGeralPage';
 import RendimentoPage from './features/funcionario/RendFuncionarioPage';
-import FuncionariosMetaPage from './features/funcionarios/FuncionariosMetaPage';
 import TvDashboardPage from './features/tv/TvDashboardPage';
 import TvMenuPage from './features/tv/TvMenuPage';
 import AvisosAdminPage from './features/tv/AvisosAdminPage';
@@ -25,7 +24,6 @@ export default function App() {
           <Route path="/upload" element={<UploadPage />} />
           <Route path="/upload/:data/:uploadId" element={<UploadDetalhePage />} />
           <Route path="/dia" element={<DashboardDia />} />
-          <Route path="/colaboradores" element={<FuncionariosMetaPage />} />
           <Route path="/avisos" element={<AvisosAdminPage />} />
           <Route path="/rendimento" element={<RendimentoPage />} />
           <Route path="/graficos" element={<GraficosPage />} />

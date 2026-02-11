@@ -14,6 +14,7 @@ import {
 } from '@tabler/icons-react';
 import { useEmpresaId } from '../../contexts/TenantContext';
 import { fetchAliases } from '../../services/db';
+import FuncionariosConfigSection from './FuncionariosConfigSection';
 
 type Centro = {
   id: number;
@@ -335,6 +336,9 @@ export default function ConfigGeralPage() {
               </Table.Tbody>
             </Table>
           </Card>
+
+          {/* Seção de Funcionários & Máquinas */}
+          <FuncionariosConfigSection />
         </Stack>
       )}
 
