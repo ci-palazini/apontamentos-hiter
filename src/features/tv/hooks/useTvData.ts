@@ -10,7 +10,7 @@ import {
 } from '../../../services/db';
 import { supabase } from '../../../lib/supabaseClient';
 import { fracDiaLogico } from '../../../utils/time';
-import type { FactoryDayRow } from '../types';
+import type { FactoryDayRow, CentroPerf, Contribuinte } from '../types';
 import {
     getNow,
     startOfDayLocal,
