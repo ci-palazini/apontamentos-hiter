@@ -9,6 +9,7 @@ export type Centro = {
     escopo: 'usinagem' | 'montagem';
     centro_pai_id: number | null;
     exibir_filhos: boolean;
+    turnos_op: number; // 1, 2, or 3
     empresa_id: number;
 };
 
@@ -25,23 +26,26 @@ export type CentroSmart = {
     ativo?: boolean;
     desativado_desde?: string | null;
     escopo?: 'usinagem' | 'montagem';
+    turnos_op?: number;
     empresa_id?: number;
 };
 
 export async function fetchCentros(empresaId: number): Promise<Centro[]> {
     const { data, error } = await supabase
         .from('centros')
-        .select('id,codigo,ativo,desativado_desde,escopo,centro_pai_id,exibir_filhos,empresa_id')
+        .select('id,codigo,ativo,desativado_desde,escopo,centro_pai_id,exibir_filhos,turnos_op,empresa_id')
         .eq('empresa_id', empresaId)
         .order('codigo', { ascending: true });
     if (error) throw error;
-    return (data ?? []) as Centro[];
+    // Default 1 if missing
+    return (data ?? []).map((c: any) => ({ ...c, turnos_op: c.turnos_op || 1 })) as Centro[];
 }
 
 export async function createCentro(
     codigo: string,
     empresaId: number,
-    escopo: 'usinagem' | 'montagem' = 'usinagem'
+    escopo: 'usinagem' | 'montagem' = 'usinagem',
+    turnos_op: number = 1
 ): Promise<number> {
     const { data, error } = await supabase
         .from('centros')
@@ -50,6 +54,7 @@ export async function createCentro(
             ativo: true,
             escopo: escopo,
             exibir_filhos: false,
+            turnos_op: turnos_op,
             empresa_id: empresaId
         })
         .select('id')

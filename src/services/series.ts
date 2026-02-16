@@ -98,3 +98,25 @@ export async function fetchPainelMaquinasResumo(
     if (error) throw error;
     return (data ?? []) as PainelMaquinaResumo[];
 }
+
+export type ProducaoFuncionario = {
+    data_wip: string;
+    centro_id: number;
+    matricula: string;
+    horas_somadas: number;
+};
+
+export async function fetchProducaoFuncionarios(
+    empresaId: number,
+    startISO: string,
+    endISO: string
+): Promise<ProducaoFuncionario[]> {
+    const { data, error } = await supabase
+        .from('totais_func_diarios')
+        .select('data_wip, centro_id, matricula, horas_somadas')
+        .eq('empresa_id', empresaId)
+        .gte('data_wip', startISO)
+        .lte('data_wip', endISO);
+    if (error) throw error;
+    return (data ?? []) as ProducaoFuncionario[];
+}

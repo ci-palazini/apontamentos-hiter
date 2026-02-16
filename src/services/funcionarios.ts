@@ -10,6 +10,7 @@ export type FuncionarioMeta = {
     meta_diaria_horas: number;
     area: AreaFuncionario | null;
     ativo: boolean;
+    turno: number;
 };
 
 export type FuncionarioDia = {
@@ -93,33 +94,41 @@ export async function fetchFuncionarioCentroRange(
 export async function fetchFuncionariosMeta(empresaId: number): Promise<FuncionarioMeta[]> {
     const { data, error } = await supabase
         .from('funcionarios_meta')
-        .select('id, matricula, nome, meta_diaria_horas, area, ativo')
+        .select('id, matricula, nome, meta_diaria_horas, area, ativo, turno')
         .eq('empresa_id', empresaId)
         .order('matricula', { ascending: true });
-
     if (error) throw error;
-    return (data ?? []) as FuncionarioMeta[];
+    // Garantir default 1 se nulo (caso migration antiga)
+    return (data ?? []).map((f: any) => ({ ...f, turno: f.turno || 1 })) as FuncionarioMeta[];
 }
 
-export async function upsertFuncionarioMeta(empresaId: number, payload: {
-    id?: number;
-    matricula: string;
-    nome: string;
-    meta_diaria_horas: number;
-    area?: AreaFuncionario | null;
-    ativo?: boolean;
-}): Promise<void> {
-    const row = {
-        ...payload,
+export async function upsertFuncionarioMeta(
+    empresaId: number,
+    f: Partial<FuncionarioMeta> & { matricula: string; nome: string; turno?: number }
+): Promise<void> {
+    const payload: any = {
+        matricula: f.matricula,
+        nome: f.nome,
         empresa_id: empresaId,
-        area: payload.area ?? null,
-        ativo: payload.ativo ?? true,
+        meta_diaria_horas: f.meta_diaria_horas ?? 8,
+        ativo: f.ativo ?? true,
+        turno: f.turno || 1
     };
+    if (f.area) payload.area = f.area;
+    if (f.id) {
+        payload.id = f.id;
+    } else {
+        // Se for insert, tenta match na matricula
+        const { data: existing } = await supabase
+            .from('funcionarios_meta')
+            .select('id')
+            .eq('empresa_id', empresaId)
+            .eq('matricula', f.matricula)
+            .maybeSingle();
+        if (existing) payload.id = existing.id;
+    }
 
-    const { error } = await supabase
-        .from('funcionarios_meta')
-        .upsert(row, { onConflict: 'matricula' });
-
+    const { error } = await supabase.from('funcionarios_meta').upsert(payload);
     if (error) throw error;
 }
 

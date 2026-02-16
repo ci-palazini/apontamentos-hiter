@@ -9,4 +9,5 @@ export type CentroPerf = {
     ader_dia: number | null; pct_meta_dia: number | null; ader_mes: number | null;
     is_stale: boolean; last_ref_time: string;
     contribuintes: Contribuinte[];
+    turnos: Record<number, { real: number; meta: number; pct: number }>;
 };

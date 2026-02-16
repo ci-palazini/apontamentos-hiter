@@ -33,6 +33,7 @@ export default function FuncionariosConfigSection() {
     const [editCentros, setEditCentros] = useState<string[]>([]);
     const [editMeta, setEditMeta] = useState('');
     const [editArea, setEditArea] = useState<string | null>(null);
+    const [editTurno, setEditTurno] = useState<string | null>('1');
     const [modalOpened, { open: openModal, close: closeModal }] = useDisclosure(false);
     const [saving, setSaving] = useState(false);
 
@@ -73,6 +74,7 @@ export default function FuncionariosConfigSection() {
         setEditCentros([]);
         setEditMeta('8');
         setEditArea(null);
+        setEditTurno('1');
         openModal();
     };
 
@@ -84,6 +86,7 @@ export default function FuncionariosConfigSection() {
         setEditCentros(f.centros.map(String));
         setEditMeta(String(f.meta_diaria_horas));
         setEditArea(f.area ?? null);
+        setEditTurno(String(f.turno || 1));
         openModal();
     };
 
@@ -106,6 +109,7 @@ export default function FuncionariosConfigSection() {
                 meta_diaria_horas: Number(editMeta) || 8,
                 area: editArea as AreaFuncionario | null,
                 ativo: true,
+                turno: Number(editTurno) || 1
             });
 
             // Buscar o ID do funcionario recém-criado/atualizado
@@ -172,6 +176,7 @@ export default function FuncionariosConfigSection() {
                         <Table.Tr>
                             <Table.Th>Matrícula</Table.Th>
                             <Table.Th>Nome</Table.Th>
+                            <Table.Th>Turno</Table.Th>
                             <Table.Th>Área</Table.Th>
                             <Table.Th>Meta Diária</Table.Th>
                             <Table.Th>Máquinas Vinculadas</Table.Th>
@@ -185,6 +190,11 @@ export default function FuncionariosConfigSection() {
                                     <Text fw={600} ff="monospace">{f.matricula}</Text>
                                 </Table.Td>
                                 <Table.Td>{f.nome}</Table.Td>
+                                <Table.Td>
+                                    <Badge variant="outline" color="gray">
+                                        {f.turno}º
+                                    </Badge>
+                                </Table.Td>
                                 <Table.Td>
                                     {f.area ? (
                                         <Badge variant="light" color={f.area === 'Montagem' ? 'blue' : f.area === 'Pintura' ? 'grape' : 'orange'}>
@@ -290,6 +300,20 @@ export default function FuncionariosConfigSection() {
                         type="number"
                         min={0}
                         step={0.5}
+                    />
+
+                    <Select
+                        label="Turno"
+                        placeholder="Selecione o turno"
+                        data={[
+                            { value: '1', label: '1º Turno' },
+                            { value: '2', label: '2º Turno' },
+                            { value: '3', label: '3º Turno' },
+                        ]}
+                        value={editTurno}
+                        onChange={setEditTurno}
+                        allowDeselect={false}
+                        required
                     />
 
                     <Select

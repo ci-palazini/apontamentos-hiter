@@ -6,6 +6,8 @@ import {
     fetchUltimoDiaComDados,
     fetchUploadsPorDia,
     fetchAvisosAtivos,
+    fetchProducaoFuncionarios,
+    fetchFuncionariosMeta,
     type AvisoTV
 } from '../../../services/db';
 import { supabase } from '../../../lib/supabaseClient';
@@ -123,6 +125,9 @@ export function useTvData(empresaId: number, scope: string | undefined) {
             const { data: centrosRaw } = await supabase.from('centros').select('*').eq('empresa_id', empresaId).order('codigo');
             const centrosAll = centrosRaw ?? [];
             const metasAtuaisAll = await fetchMetasAtuais(empresaId);
+            const funcionariosMeta = await fetchFuncionariosMeta(empresaId);
+            const funcionariosMap = new Map<string, { turno: number; nome: string }>();
+            funcionariosMeta.forEach(f => funcionariosMap.set(f.matricula, { turno: f.turno, nome: f.nome }));
 
             const centrosMap = new Map<number, any>();
             centrosAll.forEach((c: any) => centrosMap.set(c.id, c));
@@ -151,9 +156,14 @@ export function useTvData(empresaId: number, scope: string | undefined) {
             });
 
             let fullHistory: any[] = [];
+            let producaoFuncs: any[] = [];
             if (idsParaBuscarDados.size > 0) {
                 fullHistory = await fetchCentroSeriesRange(
                     empresaId, Array.from(idsParaBuscarDados), toISO(startSerie < startMes ? startSerie : startMes), toISO(diaRefLocal)
+                );
+                // Fetch details for shift breakdown (only for the reference day)
+                producaoFuncs = await fetchProducaoFuncionarios(
+                    empresaId, toISO(diaRefLocal), toISO(diaRefLocal)
                 );
             }
 
@@ -214,6 +224,37 @@ export function useTvData(empresaId: number, scope: string | undefined) {
                     }
                 }
 
+                const turnosData: Record<number, { real: number }> = { 1: { real: 0 }, 2: { real: 0 }, 3: { real: 0 } };
+                // Filter production for this machine on this day
+                const producaoDaMaquina = producaoFuncs.filter(p => p.centro_id === cardId || childrenIds.includes(p.centro_id));
+
+                producaoDaMaquina.forEach(p => {
+                    const func = funcionariosMap.get(p.matricula);
+                    const turno = func?.turno || 1;
+                    if (turnosData[turno]) {
+                        turnosData[turno].real += p.horas_somadas;
+                    } else {
+                        turnosData[1].real += p.horas_somadas;
+                    }
+                });
+
+                // Calculate shift metas
+                const turnosOp = centroCard.turnos_op || 1;
+                const metaPorTurno = metaDia > 0 ? metaDia / turnosOp : 0;
+
+                const turnosResult: Record<number, { real: number; meta: number; pct: number }> = {};
+                [1, 2, 3].forEach(t => {
+                    // Only active shifts get a meta
+                    const isShiftActive = t <= turnosOp;
+                    const meta = isShiftActive ? metaPorTurno : 0;
+                    const real = turnosData[t]?.real || 0;
+                    turnosResult[t] = {
+                        real,
+                        meta,
+                        pct: meta > 0 ? (real / meta) * 100 : 0
+                    };
+                });
+
                 let fracAplicada = fracGlobal;
                 if (!isParent && cardIsStale) fracAplicada = fracDiaLogico(lastRefStr);
                 const esperado = +(metaDia * fracAplicada).toFixed(2);
@@ -233,6 +274,7 @@ export function useTvData(empresaId: number, scope: string | undefined) {
                     ader_dia: aderDia ? +aderDia.toFixed(2) : null, pct_meta_dia: pctMetaDia ? +pctMetaDia.toFixed(2) : null,
                     ader_mes: aderMes ? +aderMes.toFixed(2) : null, is_stale: cardIsStale, last_ref_time: lastRefStr,
                     contribuintes: contribuintesList.sort((a, b) => b.real - a.real),
+                    turnos: turnosResult, // Assign calculated shift data
                 });
             });
 

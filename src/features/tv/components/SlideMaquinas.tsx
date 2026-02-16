@@ -24,6 +24,25 @@ export function SlideMaquinas({ page, isFuture }: { page: CentroPerf[]; isFuture
                                     </Stack>
                                     {isFuture ? <Badge variant="light" color="gray" size="lg">FUTURO</Badge> : <Badge color={cor} variant="filled" size="xl">{c.ader_dia == null ? '-' : `${formatNum(c.ader_dia, 0)}%`}</Badge>}
                                 </Group>
+
+                                {/* Shift Breakdown */}
+                                {!isFuture && (
+                                    <Group gap="xs" mt={-8} mb={4}>
+                                        {[1, 2, 3].map(t => {
+                                            const d = c.turnos?.[t];
+                                            if (!d || d.meta === 0) return null;
+                                            // const tCor = d.pct >= 100 ? 'green' : d.pct >= 90 ? 'blue' : d.pct >= 80 ? 'yellow' : 'red';
+                                            return (
+                                                <Group key={t} gap={4} style={{ opacity: 0.8 }}>
+                                                    <Badge variant="outline" size="xs" color="gray">{t}ºT</Badge>
+                                                    <Text size="xs" fw={700} c={d.pct >= 100 ? 'green' : d.pct >= 85 ? 'blue' : 'orange'}>
+                                                        {formatNum(d.real)}/{formatNum(d.meta)}h
+                                                    </Text>
+                                                </Group>
+                                            )
+                                        })}
+                                    </Group>
+                                )}
                                 <Group gap="md" align="center" style={{ flex: 1 }} wrap="nowrap">
                                     <RingProgress size={130} thickness={14} roundCaps sections={[{ value: clamp(c.ader_dia ?? 0), color: perfColor(c.ader_dia) }]} label={<Text ta="center" size="md" fw={900} c={cor}>{c.ader_dia ? `${c.ader_dia.toFixed(0)}%` : '-'}</Text>} />
                                     <Stack gap={4} style={{ minWidth: 0, flex: 1 }}>

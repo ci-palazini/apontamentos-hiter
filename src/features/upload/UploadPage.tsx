@@ -7,9 +7,9 @@ import * as XLSX from 'xlsx';
 import { Dropzone, MIME_TYPES } from '@mantine/dropzone';
 import { notifications } from '@mantine/notifications';
 import {
-  Title, Card, Grid, Text, Table, Group, Button, Badge, Divider, Loader,
-  Modal, TextInput, MultiSelect, Stack, Checkbox, Select
+  Title, Card, Text, Button, Badge, Loader, Group, Table, rem, Grid, Divider
 } from '@mantine/core';
+import { IconUpload, IconX, IconFileSpreadsheet } from '@tabler/icons-react';
 import { DateInput } from '@mantine/dates';
 import { useEmpresaId } from '../../contexts/TenantContext';
 import {
@@ -23,9 +23,11 @@ import {
   fetchFuncionariosMeta,
   fetchFuncionarioCentros,
   upsertFuncionarioMeta,
-  setFuncionarioCentros,
+  addFuncionarioCentro,
   type FuncionarioMeta
+  // type FuncionarioCentro removed
 } from '../../services/funcionarios';
+import LinkResolutionModal, { type MissingUser, type MissingLink } from './LinkResolutionModal';
 
 /* ==========================
    Tipos Locais
@@ -39,28 +41,10 @@ type ParsedRow = {
   centro_id: number;
   aliquota_horas: number;
   tipo_raw?: string | null;
-  matricula?: string | null;
+  matricula: string;       // AGORA OBRIGATÓRIO
 };
 
 type UploadError = { tipo: 'sheet' | 'header' | 'row' | 'meta' | 'persist'; mensagem: string };
-
-// Estado do cadastro rápido de funcionários
-type PendingRegistration = {
-  matricula: string;
-  nome: string;
-  centros: string[];  // centro_ids como strings para MultiSelect
-};
-
-// Estado de conflitos de realocação
-type ReallocationConflict = {
-  matricula: string;
-  nome: string;
-  centroCsvId: number;
-  centroCsvCodigo: string;
-  centrosVinculados: { id: number; codigo: string }[];
-  selectedCentroId: number;    // centro sugerido/selecionado
-  aceitar: boolean;            // se o usuário aceita a realocação
-};
 
 // Dados pendentes entre etapas do upload
 type PendingUpload = {
@@ -122,26 +106,6 @@ function groupByDate<T extends { data_wip: string }>(rows: T[]) {
   return map;
 }
 
-function compactLineRanges(nums: number[]): string {
-  if (!nums.length) return '';
-  const a = [...nums].sort((x, y) => x - y);
-  const out: string[] = [];
-  let start = a[0];
-  let prev = a[0];
-
-  for (let i = 1; i < a.length; i += 1) {
-    const n = a[i];
-    if (n === prev + 1) {
-      prev = n;
-    } else {
-      out.push(start === prev ? `${start}` : `${start}-${prev}`);
-      start = prev = n;
-    }
-  }
-  out.push(start === prev ? `${start}` : `${start}-${prev}`);
-  return out.join(', ');
-}
-
 function parseWipISO(input: unknown): string | null {
   if (input == null) return null;
   if (typeof input === 'number') return excelSerialToISODate(input);
@@ -194,14 +158,10 @@ export default function UploadPage() {
   // --- Estados dos modais de pré-processamento ---
   const [pendingUpload, setPendingUpload] = useState<PendingUpload | null>(null);
 
-  // Modal 1: Cadastro rápido de funcionários
-  const [showRegistrationModal, setShowRegistrationModal] = useState(false);
-  const [pendingRegistrations, setPendingRegistrations] = useState<PendingRegistration[]>([]);
-  const [centroOptions, setCentroOptions] = useState<{ value: string; label: string }[]>([]);
-
-  // Modal 2: Realocação de máquinas
-  const [showReallocationModal, setShowReallocationModal] = useState(false);
-  const [reallocationConflicts, setReallocationConflicts] = useState<ReallocationConflict[]>([]);
+  // Modal 1: Resolução de Vínculos (Substitui Registration e Reallocation)
+  const [showLinkModal, setShowLinkModal] = useState(false);
+  const [missingUsers, setMissingUsers] = useState<MissingUser[]>([]);
+  const [missingLinks, setMissingLinks] = useState<MissingLink[]>([]);
 
   const pushLog = (s: string) => setLog((prev) => [...prev, s]);
 
@@ -277,7 +237,7 @@ export default function UploadPage() {
     return XLSX.read(data, { type: 'array' });
   };
 
-  const fetchCentros = async (): Promise<Centro[]> => {
+  const fetchSupabaseCentros = async (): Promise<Centro[]> => {
     const { data, error } = await supabase.from('centros').select('id, codigo, ativo, desativado_desde').eq('empresa_id', empresaId);
     if (error) throw error;
     return data ?? [];
@@ -296,7 +256,7 @@ export default function UploadPage() {
   };
 
   const carregarMapeamento = async () => {
-    const centros = await fetchCentros();
+    const centros = await fetchSupabaseCentros();
     const aliases = await fetchAlias();
 
     const centrosById = new Map<number, Centro>();
@@ -330,7 +290,6 @@ export default function UploadPage() {
     if (!rows.length) return;
 
     // 1. Busca o estado anterior (último upload ativo deste dia)
-    // Se não houver anterior, o Map vem vazio.
     const estadoAnterior = await fetchEstadoAnterior(empresaId, dataISO);
 
     // Data de referência padrão ("agora"), caso o dado seja novo ou tenha mudado
@@ -343,10 +302,11 @@ export default function UploadPage() {
       data_wip: string;
       centro_id: number;
       horas_somadas: number;
-      // data_referencia será decidida abaixo
     }>();
 
     for (const r of rows) {
+      // IMPORTANTE: Agora só consideramos linhas com matrícula válida e vinculada!
+      // (Isso já foi garantido na validação anterior)
       const key = `${r.data_wip}|${r.centro_id}`;
       const cur = agg.get(key) ?? {
         data_wip: r.data_wip,
@@ -394,13 +354,12 @@ export default function UploadPage() {
 
 
     // ---- B. Funcionários (totais_func_diarios) - Mantém lógica padrão ----
-    // (Poderia aplicar a mesma lógica aqui, mas geralmente o dashboard foca na máquina)
     const aggFunc = new Map<string, {
       data_wip: string; centro_id: number; matricula: string; horas_somadas: number
     }>();
 
     for (const r of rows) {
-      if (!r.matricula) continue;
+      // Como matricula agora é obrigatória, não precisamos checar se existe
       const key = `${r.data_wip}|${r.centro_id}|${r.matricula}`;
       const cur = aggFunc.get(key) ?? {
         data_wip: r.data_wip,
@@ -473,11 +432,12 @@ export default function UploadPage() {
     const colTipo = detectCol(headers, ['tipo', 'origem']);
     const colFuncionario = detectCol(headers, ['funcionario', 'funcionário', 'matricula', 'matrícula', 'colaborador']);
 
-    if (!colData || !colCategoria || !colAliquota) {
+    if (!colData || !colCategoria || !colAliquota || !colFuncionario) {
       const missing = [
         !colData ? 'Data WIP' : null,
         !colCategoria ? 'Categoria' : null,
         !colAliquota ? 'Alíquota' : null,
+        !colFuncionario ? 'Matrícula/Funcionário' : null,
       ].filter(Boolean).join(', ');
       throw { tipo: 'header', mensagem: `Colunas obrigatórias ausentes: ${missing}.` } as UploadError;
     }
@@ -485,7 +445,6 @@ export default function UploadPage() {
     const rows: ParsedRow[] = [];
     const erros: UploadError[] = [];
     const avisos: string[] = [];
-    const semMetaPorCategoria = new Map<string, number[]>();
 
     for (let idx = 0; idx < sheetRows.length; idx += 1) {
       const raw = sheetRows[idx];
@@ -493,20 +452,15 @@ export default function UploadPage() {
 
       const dataWip = parseWipISO(raw[colData]);
       if (!dataWip) {
+        // ... (ignorando linhas de total/vazias como antes)
         const linhaTexto = Object.values(raw).map((v) => String(v ?? '').toLowerCase()).join(' ');
-        if (linhaTexto.includes('total')) {
-          avisos.push(`Linha ${excelRow}: linha de total/rodapé ignorada.`);
-          continue;
-        }
+        if (linhaTexto.includes('total')) continue;
         const soVazios = Object.values(raw).every((v) => {
           if (v == null) return true;
           const s = String(v).trim();
           return s === '';
         });
-        if (soVazios) {
-          avisos.push(`Linha ${excelRow}: linha vazia ignorada.`);
-          continue;
-        }
+        if (soVazios) continue;
         erros.push({ tipo: 'row', mensagem: `Linha ${excelRow}: Data WIP inválida (${raw[colData]}).` });
         continue;
       }
@@ -522,21 +476,13 @@ export default function UploadPage() {
       const centroId = mapping.aliasIndex.get(k1) ?? mapping.aliasIndex.get(k2) ?? null;
 
       if (centroId == null) {
-        const arr = semMetaPorCategoria.get(categoriaRaw) ?? [];
-        arr.push(excelRow);
-        semMetaPorCategoria.set(categoriaRaw, arr);
+        // Se não achou centro, ignora (ou avisa)
         continue;
       }
 
       const centro = mapping.centrosById.get(centroId);
-      if (!centro) {
-        avisos.push(`Centro id=${centroId} não encontrado no cadastro (linha ${excelRow}).`);
-        continue;
-      }
-      if (!isAtivoNoDia(centro, dataWip)) {
-        avisos.push(`Centro "${centro.codigo}" inativo em ${dataWip} (linha ${excelRow}) — ignorado.`);
-        continue;
-      }
+      if (!centro) continue;
+      if (!isAtivoNoDia(centro, dataWip)) continue;
 
       const aliParsed = parsePtBrNumber(raw[colAliquota]);
       if (!isFiniteNumber(aliParsed)) {
@@ -546,11 +492,14 @@ export default function UploadPage() {
       const aliquota = +aliParsed.toFixed(4);
       const tipoRaw = colTipo ? (String(raw[colTipo] ?? '').trim() || null) : null;
 
-      let matricula: string | null = null;
-      if (colFuncionario) {
-        const rawF = String(raw[colFuncionario] ?? '').trim();
-        const onlyDigits = (rawF.match(/\d+/)?.[0] ?? '').slice(0, 8);
-        matricula = onlyDigits && onlyDigits.length >= 3 ? onlyDigits : null;
+      // --- VALIDAÇÃO DA MATRÍCULA ---
+      const rawF = String(raw[colFuncionario] ?? '').trim();
+      const onlyDigits = (rawF.match(/\d+/)?.[0] ?? '').slice(0, 8);
+      const matricula = onlyDigits && onlyDigits.length >= 3 ? onlyDigits : null;
+
+      if (!matricula) {
+        erros.push({ type: 'row', mensagem: `Linha ${excelRow}: Matrícula inválida ou ausente.` } as any);
+        continue;
       }
 
       rows.push({
@@ -561,12 +510,6 @@ export default function UploadPage() {
         tipo_raw: tipoRaw,
         matricula,
       });
-    }
-
-    if (semMetaPorCategoria.size) {
-      for (const [categoria, linhas] of semMetaPorCategoria) {
-        avisos.push(`Categoria "${categoria}" sem meta vinculada (linhas: ${compactLineRanges(linhas)})`);
-      }
     }
 
     if (erros.length) {
@@ -600,7 +543,7 @@ export default function UploadPage() {
       pushLog('Carregando mapeamentos de centros...');
       const mapping = await carregarMapeamento();
 
-      pushLog('Normalizando linhas...');
+      pushLog('Normalizando linhas (Matrículas Obrigatórias)...');
       const { rows, avisos } = await normalizarLinhas(json, mapping);
       if (avisos.length) avisos.forEach((m) => pushLog(`Aviso: ${m}`));
       if (!rows.length) throw { tipo: 'row', mensagem: 'Nenhuma linha válida após normalização.' } as UploadError;
@@ -608,37 +551,90 @@ export default function UploadPage() {
       const groups = groupByDate(rows);
       pushLog(`Detectadas ${groups.size} data(s): ${[...groups.keys()].join(', ')}`);
 
-      // --- Preparar opções de centros para modais ---
-      const opts = [...mapping.centrosById.values()].map(c => ({ value: String(c.id), label: c.codigo }));
-      setCentroOptions(opts);
+      // ===============================================
+      // NOVA VALIDAÇÃO DE VÍNCULOS
+      // ===============================================
+      pushLog('Validando vínculos Matrícula ↔ Máquina...');
 
-      // --- ETAPA 1: Verificar matrículas não cadastradas ---
-      const matriculasUnicas = new Set<string>();
-      for (const r of rows) {
-        if (r.matricula) matriculasUnicas.add(r.matricula);
-      }
+      // 1. Coletar pares únicos (matricula, centro_id) do arquivo
+      const paresNoArquivo = new Map<string, Set<number>>();
+      rows.forEach(r => {
+        const s = paresNoArquivo.get(r.matricula) ?? new Set();
+        s.add(r.centro_id);
+        paresNoArquivo.set(r.matricula, s);
+      });
 
-      if (matriculasUnicas.size > 0) {
-        pushLog('Verificando matrículas cadastradas...');
-        const metasExistentes = await fetchFuncionariosMeta(empresaId);
-        const matriculasCadastradas = new Set(metasExistentes.map(m => m.matricula));
-        const novas = [...matriculasUnicas].filter(m => !matriculasCadastradas.has(m));
+      // 2. Fetch dados existentes
+      const [metas, vinculos] = await Promise.all([
+        fetchFuncionariosMeta(empresaId),
+        fetchFuncionarioCentros(empresaId),
+      ]);
 
-        if (novas.length > 0) {
-          pushLog(`⚠️ ${novas.length} matrícula(s) não cadastrada(s): ${novas.join(', ')}`);
-          pushLog('Aguardando cadastro dos funcionários...');
+      const metaByMatricula = new Map<string, FuncionarioMeta>();
+      metas.forEach(m => metaByMatricula.set(m.matricula, m));
 
-          // Salvar estado para continuar depois
-          setPendingUpload({ file, rows, groups, mapping, avisos });
-          setPendingRegistrations(novas.map(m => ({ matricula: m, nome: '', centros: [] })));
-          setShowRegistrationModal(true);
-          setBusy(false);
-          return; // Pausa aqui, fluxo continua no callback do modal
+      // Mapa: Matricula -> Set de CentroIDs vinculados
+      const existingLinks = new Map<string, Set<number>>();
+      vinculos.forEach(v => {
+        const m = metas.find(meta => meta.id === v.funcionario_meta_id);
+        if (m) {
+          const s = existingLinks.get(m.matricula) ?? new Set();
+          s.add(v.centro_id);
+          existingLinks.set(m.matricula, s);
+        }
+      });
+
+      const mUsers: MissingUser[] = [];
+      const mLinks: MissingLink[] = [];
+
+      // 3. Verificar cada par do arquivo
+      for (const [matricula, centroIds] of paresNoArquivo.entries()) {
+        const userExists = metaByMatricula.has(matricula);
+
+        if (!userExists) {
+          // Usuário inexistente -> Vai ser criado e já vinculado a TODAS as máquinas que apareceram pra ele
+          mUsers.push({
+            matricula,
+            nome: '', // será preenchido
+            machineIds: [...centroIds],
+            machineCodes: [...centroIds].map(id => mapping.centrosById.get(id)?.codigo || `ID ${id}`)
+          });
+        } else {
+          // Usuário existe -> Checar se tem vinculo
+          const linkedIds = existingLinks.get(matricula) ?? new Set();
+          const missingForThisUser: number[] = [];
+
+          centroIds.forEach(cid => {
+            if (!linkedIds.has(cid)) {
+              missingForThisUser.push(cid);
+            }
+          });
+
+          if (missingForThisUser.length > 0) {
+            mLinks.push({
+              matricula,
+              nome: metaByMatricula.get(matricula)?.nome || 'Desconhecido',
+              machineIds: missingForThisUser,
+              machineCodes: missingForThisUser.map(id => mapping.centrosById.get(id)?.codigo || `ID ${id}`)
+            });
+          }
         }
       }
 
-      // Se não houver matrículas novas, ir direto para etapa 2
-      await etapa2VerificarRealocacao(file, rows, groups, mapping);
+      if (mUsers.length > 0 || mLinks.length > 0) {
+        pushLog(`⚠️ Atenção: ${mUsers.length} novo(s) funcionário(s) e ${mLinks.length} vínculo(s) ausente(s).`);
+        pushLog('Aguardando resolução pelo usuário...');
+
+        setPendingUpload({ file, rows, groups, mapping, avisos: [] });
+        setMissingUsers(mUsers);
+        setMissingLinks(mLinks);
+        setShowLinkModal(true);
+        setBusy(false);
+        return; // PAUSA AQUI
+      }
+
+      // Se tudo OK, persiste direto
+      await etapa3Persistir(file, rows, groups);
 
     } catch (err: any) {
       console.error(err);
@@ -648,95 +644,81 @@ export default function UploadPage() {
       notifications.show({ title: 'Falha no upload', message: mensagem, color: 'red' });
       setBusy(false);
     }
-  }, [dia, refetchUploads]);
+  }, [dia, refetchUploads, empresaId]);
+
 
   /* ==========================
-     ETAPA 2: Verificar Realocação
+     Callback e Continuação
   ========================== */
-  const etapa2VerificarRealocacao = async (
-    file: File,
-    rows: ParsedRow[],
-    groups: Map<string, ParsedRow[]>,
-    mapping: { centrosById: Map<number, Centro>; aliasIndex: Map<string, number> }
+  const handleLinkResolutionConfirm = async (
+    newUsers: { matricula: string; nome: string; centroIds: number[]; turno: number }[],
+    newLinks: { matricula: string; centroIds: number[] }[]
   ) => {
+    setShowLinkModal(false);
+    setBusy(true);
+
     try {
-      // Carregar vínculos atualizados
-      const [metas, vinculos] = await Promise.all([
-        fetchFuncionariosMeta(empresaId),
-        fetchFuncionarioCentros(empresaId),
-      ]);
+      pushLog(`Criando ${newUsers.length} usuários e ${newLinks.length} conjuntos de vínculos...`);
 
-      // Montar mapa de matrícula -> centros vinculados
-      const metaByMatricula = new Map<string, FuncionarioMeta>();
-      for (const m of metas) metaByMatricula.set(m.matricula, m);
+      // 1. Criar Usuários
+      for (const u of newUsers) {
+        // Cria Meta
+        await upsertFuncionarioMeta(empresaId, {
+          matricula: u.matricula,
+          nome: u.nome,
+          meta_diaria_horas: 0, // default
+          turno: u.turno
+          // area: null 
+        });
 
-      const centrosByFuncId = new Map<number, number[]>();
-      for (const v of vinculos) {
-        const arr = centrosByFuncId.get(v.funcionario_meta_id) ?? [];
-        arr.push(v.centro_id);
-        centrosByFuncId.set(v.funcionario_meta_id, arr);
-      }
+        // Precisamos do ID gerado para vincular
+        // (Como upsertFuncionarioMeta não retorna ID diretamente e é void, vamos buscar novamente.
+        //  Poderíamos otimizar, mas a API atual é assim)
+        const [func] = (await fetchFuncionariosMeta(empresaId)).filter(f => f.matricula === u.matricula);
 
-      // Detectar conflitos (agrupar por matrícula + centro_csv)
-      const conflictMap = new Map<string, ReallocationConflict>();
-
-      for (const r of rows) {
-        if (!r.matricula) continue;
-        const meta = metaByMatricula.get(r.matricula);
-        if (!meta) continue; // sem cadastro = sem vínculo
-
-        const funcCentros = centrosByFuncId.get(meta.id) ?? [];
-        if (funcCentros.length === 0) continue; // sem vínculos = não realocar
-
-        if (funcCentros.includes(r.centro_id)) continue; // OK, máquina está na lista
-
-        // Conflito!
-        const key = `${r.matricula}|${r.centro_id}`;
-        if (!conflictMap.has(key)) {
-          const centrosVinc = funcCentros.map(cid => ({
-            id: cid,
-            codigo: mapping.centrosById.get(cid)?.codigo ?? `ID ${cid}`,
-          }));
-          const csvCodigo = mapping.centrosById.get(r.centro_id)?.codigo ?? `ID ${r.centro_id}`;
-
-          conflictMap.set(key, {
-            matricula: r.matricula,
-            nome: meta.nome,
-            centroCsvId: r.centro_id,
-            centroCsvCodigo: csvCodigo,
-            centrosVinculados: centrosVinc,
-            selectedCentroId: centrosVinc[0]?.id ?? r.centro_id,
-            aceitar: true,
-          });
+        if (func) {
+          for (const cid of u.centroIds) {
+            await addFuncionarioCentro(empresaId, func.id, cid);
+          }
         }
       }
 
-      if (conflictMap.size > 0) {
-        pushLog(`⚠️ ${conflictMap.size} conflito(s) de máquina detectado(s). Aguardando decisão...`);
-        setPendingUpload({ file, rows, groups, mapping, avisos: [] });
-        setReallocationConflicts([...conflictMap.values()]);
-        setShowReallocationModal(true);
-        setBusy(false);
-        return;
+      // 2. Criar Vínculos (para usuários já existentes)
+      const metas = await fetchFuncionariosMeta(empresaId);
+      for (const l of newLinks) {
+        const func = metas.find(f => f.matricula === l.matricula);
+        if (func) {
+          for (const cid of l.centroIds) {
+            // Evitar duplicação se rodar 2x (addFuncionarioCentro não tem onConflict ignore fácil, 
+            // mas supomos que o modal filtrou o que faltava)
+            await addFuncionarioCentro(empresaId, func.id, cid).catch(() => { });
+          }
+        }
       }
 
-      // Sem conflitos, persistir direto
-      await etapa3Persistir(file, rows, groups);
+      pushLog('Vínculos atualizados com sucesso.');
+
+      // Retomar persistência
+      if (pendingUpload) {
+        await etapa3Persistir(pendingUpload.file, pendingUpload.rows, pendingUpload.groups);
+      }
 
     } catch (err: any) {
       console.error(err);
-      pushLog(`Erro na verificação de realocação: ${err?.message ?? err}`);
-      notifications.show({ title: 'Erro', message: err?.message ?? 'Erro desconhecido', color: 'red' });
+      const mensagem = err?.message || 'Erro ao criar vínculos.';
+      pushLog(`Erro: ${mensagem}`);
+      notifications.show({ title: 'Erro', message: mensagem, color: 'red' });
       setBusy(false);
     }
   };
+
 
   /* ==========================
      ETAPA 3: Persistir
   ========================== */
   const etapa3Persistir = async (
     file: File,
-    _rows: ParsedRow[],
+    _rows: ParsedRow[], // não usamos diretamente _rows pois usamos os grupos
     groups: Map<string, ParsedRow[]>
   ) => {
     setBusy(true);
@@ -787,114 +769,6 @@ export default function UploadPage() {
     }
   };
 
-  /* ==========================
-     Callbacks dos modais
-  ========================== */
-
-  // Modal 1: Cadastro rápido concluído
-  const onRegistrationComplete = async () => {
-    setShowRegistrationModal(false);
-    setBusy(true);
-
-    try {
-      // Salvar todos os funcionários novos
-      for (const reg of pendingRegistrations) {
-        if (!reg.nome.trim()) {
-          pushLog(`⚠️ Matrícula ${reg.matricula}: nome não preenchido, pulando...`);
-          continue;
-        }
-        await upsertFuncionarioMeta(empresaId, {
-          matricula: reg.matricula,
-          nome: reg.nome.trim(),
-          meta_diaria_horas: 8,
-          ativo: true,
-        });
-
-        // Buscar ID recém-criado para vincular centros
-        if (reg.centros.length > 0) {
-          const { data: metaRow } = await supabase
-            .from('funcionarios_meta')
-            .select('id')
-            .eq('empresa_id', empresaId)
-            .eq('matricula', reg.matricula)
-            .single();
-
-          if (metaRow) {
-            await setFuncionarioCentros(empresaId, metaRow.id, reg.centros.map(Number));
-          }
-        }
-
-        pushLog(`✅ Funcionário ${reg.matricula} (${reg.nome}) cadastrado.`);
-      }
-
-      // Continuar com etapa 2
-      if (pendingUpload) {
-        await etapa2VerificarRealocacao(
-          pendingUpload.file,
-          pendingUpload.rows,
-          pendingUpload.groups,
-          pendingUpload.mapping
-        );
-      }
-    } catch (err: any) {
-      console.error(err);
-      pushLog(`Erro ao cadastrar funcionários: ${err?.message ?? err}`);
-      notifications.show({ title: 'Erro', message: err?.message ?? 'Erro', color: 'red' });
-      setBusy(false);
-    }
-  };
-
-  // Modal 2: Realocação concluída
-  const onReallocationComplete = async () => {
-    setShowReallocationModal(false);
-    if (!pendingUpload) return;
-    setBusy(true);
-
-    try {
-      // Aplicar realocações aceitas
-      const realocMap = new Map<string, number>(); // key: "matricula|centroCsvId" -> novo centroId
-      for (const c of reallocationConflicts) {
-        if (c.aceitar) {
-          realocMap.set(`${c.matricula}|${c.centroCsvId}`, c.selectedCentroId);
-          pushLog(`🔀 Realocando: ${c.matricula} (${c.nome}) de ${c.centroCsvCodigo} → ${pendingUpload.mapping.centrosById.get(c.selectedCentroId)?.codigo ?? c.selectedCentroId}`);
-        }
-      }
-
-      // Aplicar nas rows
-      const rowsModificadas = pendingUpload.rows.map(r => {
-        if (!r.matricula) return r;
-        const key = `${r.matricula}|${r.centro_id}`;
-        const novoCentro = realocMap.get(key);
-        if (novoCentro !== undefined) {
-          return { ...r, centro_id: novoCentro };
-        }
-        return r;
-      });
-
-      // Reagrupar por data
-      const newGroups = groupByDate(rowsModificadas);
-
-      await etapa3Persistir(pendingUpload.file, rowsModificadas, newGroups);
-
-    } catch (err: any) {
-      console.error(err);
-      pushLog(`Erro ao aplicar realocações: ${err?.message ?? err}`);
-      notifications.show({ title: 'Erro', message: err?.message ?? 'Erro', color: 'red' });
-      setBusy(false);
-    }
-  };
-
-  // Modal 2: Manter tudo original
-  const onReallocationSkip = async () => {
-    setShowReallocationModal(false);
-    if (!pendingUpload) return;
-    pushLog('Realocações ignoradas. Mantendo dados originais do CSV.');
-    await etapa3Persistir(pendingUpload.file, pendingUpload.rows, pendingUpload.groups);
-  };
-
-  /* ==========================
-     Render
-  ========================== */
   return (
     <div style={{ padding: '24px 32px' }}>
       <Title order={2} mb="sm">Metas - Upload</Title>
@@ -904,19 +778,20 @@ export default function UploadPage() {
       </Text>
 
       <Grid gutter="lg">
-        <Grid.Col span={{ base: 12, md: 8 }}>
+        <Grid.Col span={12}>
           <Card withBorder shadow="sm" radius="lg" p="lg">
             <Dropzone
               onDrop={onDrop}
-              disabled={busy}
-              multiple={false}
+              onReject={() => notifications.show({ title: 'Arquivo inválido', message: 'Selecione um arquivo Excel (.xlsx, .xls)', color: 'red' })}
+              maxSize={50 * 1024 * 1024}
               accept={[
                 MIME_TYPES.xlsx,
                 MIME_TYPES.xls,
                 'application/vnd.ms-excel.sheet.macroEnabled.12',
                 'application/octet-stream',
               ]}
-              maxSize={50 * 1024 * 1024}
+              loading={busy}
+              multiple={false}
             >
               <div style={{ padding: '48px 12px', textAlign: 'center' }}>
                 {busy ? (
@@ -925,24 +800,36 @@ export default function UploadPage() {
                     <Text>Processando arquivo...</Text>
                   </Group>
                 ) : (
-                  <>
-                    <Title order={4} mb={6}>Arraste o arquivo aqui ou clique para selecionar</Title>
-                    <div style={{ color: '#667085', fontSize: 14 }}>Formatos: .xlsx / .xls • Máx. 50&nbsp;MB</div>
-                  </>
+                  <Group justify="center" gap="xl" style={{ minHeight: 120, pointerEvents: 'none' }}>
+                    <Dropzone.Accept>
+                      <IconUpload
+                        style={{ width: rem(52), height: rem(52), color: 'var(--mantine-color-blue-6)' }}
+                        stroke={1.5}
+                      />
+                    </Dropzone.Accept>
+                    <Dropzone.Reject>
+                      <IconX
+                        style={{ width: rem(52), height: rem(52), color: 'var(--mantine-color-red-6)' }}
+                        stroke={1.5}
+                      />
+                    </Dropzone.Reject>
+                    <Dropzone.Idle>
+                      <IconFileSpreadsheet
+                        style={{ width: rem(52), height: rem(52), color: 'var(--mantine-color-dimmed)' }}
+                        stroke={1.5}
+                      />
+                    </Dropzone.Idle>
+
+                    <div>
+                      <Text size="xl" inline>
+                        Arraste o arquivo aqui ou clique para selecionar
+                      </Text>
+                      <div style={{ color: '#667085', fontSize: 14 }}>Formatos: .xlsx / .xls • Máx. 50 MB</div>
+                    </div>
+                  </Group>
                 )}
               </div>
             </Dropzone>
-          </Card>
-        </Grid.Col>
-
-        <Grid.Col span={{ base: 12, md: 4 }}>
-          <Card withBorder shadow="sm" radius="lg" p="lg">
-            <Title order={6} mb="sm">Dicas</Title>
-            <ul style={{ margin: 0, paddingLeft: 16, color: '#475467' }}>
-              <li>“Categoria” mapeia para centros com meta.</li>
-              <li>Envie uploads recorrentes ao longo do dia.</li>
-              <li><b>Máquinas paradas/sem apontamento</b> não terão a meta aumentada injustamente (o relógio delas "para").</li>
-            </ul>
           </Card>
         </Grid.Col>
 
@@ -960,12 +847,19 @@ export default function UploadPage() {
                 onChange={handleDiaChange}
                 valueFormat="DD/MM/YYYY"
                 locale="pt-BR"
-                dateParser={(input) => parseLocalDateString(input) ?? new Date()}
+                placeholder="DD/MM/AAAA"
+                dateParser={(input) => {
+                  if (!input) return null;
+                  const d = new Date(input);
+                  return isNaN(d.getTime()) ? new Date() : d;
+                }}
                 size="sm"
                 styles={{
                   input: { minWidth: 132, textAlign: 'center' },
                   root: { marginLeft: 'auto' },
                 }}
+                maxDate={new Date()}
+                clearable
               />
             </Group>
 
@@ -1016,7 +910,7 @@ export default function UploadPage() {
 
                         <Table.Td>{enviado}</Table.Td>
                         <Table.Td style={{ textAlign: 'right' }}>{u.linhas}</Table.Td>
-                        <Table.Td style={{ textAlign: 'right' }}>{u.horas_total.toFixed(2)} h</Table.Td>
+                        <Table.Td style={{ textAlign: 'right' }}>{Number(u.horas_total).toFixed(2)} h</Table.Td>
 
                         <Table.Td>
                           {ativo
@@ -1036,7 +930,7 @@ export default function UploadPage() {
                                 setLoadingUploads(true);
                                 try {
                                   const iso = dateToISO(dia);
-                                  await marcarUpload(u.upload_id, iso);
+                                  await setUploadAtivo(iso, u.upload_id);
                                   await refetchUploads(dia);
                                 } catch (e) {
                                   console.error(e);
@@ -1061,162 +955,28 @@ export default function UploadPage() {
         <Grid.Col span={12}>
           <Card withBorder shadow="sm" radius="lg" p="md">
             <Title order={6} style={{ opacity: 0.9, letterSpacing: 0.3 }} mb="xs">Log</Title>
-            <pre style={{ whiteSpace: 'pre-wrap', color: '#101828', margin: 0, fontSize: 13 }}>
-              {log.join('\n') || 'Nenhum evento ainda.'}
-            </pre>
+            <div style={{ maxHeight: 200, overflowY: 'auto' }}>
+              <pre style={{ whiteSpace: 'pre-wrap', color: '#101828', margin: 0, fontSize: 13, fontFamily: 'monospace' }}>
+                {log.join('\n') || 'Nenhum evento ainda.'}
+              </pre>
+            </div>
           </Card>
         </Grid.Col>
       </Grid>
 
-      {/* ===== MODAL 1: Cadastro Rápido de Funcionários ===== */}
-      <Modal
-        opened={showRegistrationModal}
-        onClose={() => { setShowRegistrationModal(false); setPendingUpload(null); }}
-        title={<Text fw={700} size="lg">👤 Cadastro de Funcionários</Text>}
-        size="xl"
-        closeOnClickOutside={false}
-      >
-        <Stack gap="md">
-          <Text size="sm" c="dimmed">
-            As seguintes matrículas foram encontradas no CSV mas não estão cadastradas.
-            Preencha o nome e selecione as máquinas vinculadas a cada funcionário.
-          </Text>
+      {/* Novo Modal de Resolução de Vínculos */}
+      <LinkResolutionModal
+        opened={showLinkModal}
+        onClose={() => {
+          setShowLinkModal(false);
+          setPendingUpload(null); // Cancelar upload
+          pushLog('Upload cancelado pelo usuário.');
+        }}
+        onConfirm={handleLinkResolutionConfirm}
+        missingUsers={missingUsers}
+        missingLinks={missingLinks}
+      />
 
-          <Table withTableBorder highlightOnHover>
-            <Table.Thead>
-              <Table.Tr>
-                <Table.Th w={100}>Matrícula</Table.Th>
-                <Table.Th>Nome</Table.Th>
-                <Table.Th>Máquinas</Table.Th>
-              </Table.Tr>
-            </Table.Thead>
-            <Table.Tbody>
-              {pendingRegistrations.map((reg, idx) => (
-                <Table.Tr key={reg.matricula}>
-                  <Table.Td>
-                    <Text fw={700} ff="monospace">{reg.matricula}</Text>
-                  </Table.Td>
-                  <Table.Td>
-                    <TextInput
-                      placeholder="Nome do funcionário"
-                      value={reg.nome}
-                      onChange={e => {
-                        const arr = [...pendingRegistrations];
-                        arr[idx] = { ...arr[idx], nome: e.currentTarget.value };
-                        setPendingRegistrations(arr);
-                      }}
-                      size="sm"
-                      required
-                    />
-                  </Table.Td>
-                  <Table.Td>
-                    <MultiSelect
-                      placeholder="Selecione máquinas..."
-                      data={centroOptions}
-                      value={reg.centros}
-                      onChange={val => {
-                        const arr = [...pendingRegistrations];
-                        arr[idx] = { ...arr[idx], centros: val };
-                        setPendingRegistrations(arr);
-                      }}
-                      searchable
-                      size="sm"
-                    />
-                  </Table.Td>
-                </Table.Tr>
-              ))}
-            </Table.Tbody>
-          </Table>
-
-          <Group justify="flex-end">
-            <Button variant="default" onClick={() => { setShowRegistrationModal(false); setPendingUpload(null); }}>
-              Cancelar Upload
-            </Button>
-            <Button
-              onClick={onRegistrationComplete}
-              disabled={pendingRegistrations.some(r => !r.nome.trim())}
-            >
-              Cadastrar e Continuar
-            </Button>
-          </Group>
-        </Stack>
-      </Modal>
-
-      {/* ===== MODAL 2: Realocação de Máquinas ===== */}
-      <Modal
-        opened={showReallocationModal}
-        onClose={() => { setShowReallocationModal(false); setPendingUpload(null); }}
-        title={<Text fw={700} size="lg">⚠️ Realocação de Horas</Text>}
-        size="xl"
-        closeOnClickOutside={false}
-      >
-        <Stack gap="md">
-          <Text size="sm" c="dimmed">
-            As seguintes linhas apontam horas em máquinas que <strong>não estão vinculadas</strong> ao
-            funcionário. Marque quais deseja realocar para a máquina correta.
-          </Text>
-
-          <Table withTableBorder highlightOnHover>
-            <Table.Thead>
-              <Table.Tr>
-                <Table.Th w={60}>Aceitar</Table.Th>
-                <Table.Th w={90}>Matrícula</Table.Th>
-                <Table.Th>Nome</Table.Th>
-                <Table.Th>Máquina CSV</Table.Th>
-                <Table.Th>Realocar para</Table.Th>
-              </Table.Tr>
-            </Table.Thead>
-            <Table.Tbody>
-              {reallocationConflicts.map((c, idx) => (
-                <Table.Tr key={`${c.matricula}-${c.centroCsvId}`} bg={c.aceitar ? 'var(--mantine-color-yellow-0)' : undefined}>
-                  <Table.Td>
-                    <Checkbox
-                      checked={c.aceitar}
-                      onChange={e => {
-                        const arr = [...reallocationConflicts];
-                        arr[idx] = { ...arr[idx], aceitar: e.currentTarget.checked };
-                        setReallocationConflicts(arr);
-                      }}
-                    />
-                  </Table.Td>
-                  <Table.Td><Text ff="monospace" fw={600}>{c.matricula}</Text></Table.Td>
-                  <Table.Td>{c.nome}</Table.Td>
-                  <Table.Td>
-                    <Badge color="red" variant="light">{c.centroCsvCodigo}</Badge>
-                  </Table.Td>
-                  <Table.Td>
-                    {c.centrosVinculados.length === 1 ? (
-                      <Badge color="green" variant="light">{c.centrosVinculados[0].codigo}</Badge>
-                    ) : (
-                      <Select
-                        data={c.centrosVinculados.map(cv => ({ value: String(cv.id), label: cv.codigo }))}
-                        value={String(c.selectedCentroId)}
-                        onChange={val => {
-                          if (!val) return;
-                          const arr = [...reallocationConflicts];
-                          arr[idx] = { ...arr[idx], selectedCentroId: Number(val) };
-                          setReallocationConflicts(arr);
-                        }}
-                        size="sm"
-                        disabled={!c.aceitar}
-                      />
-                    )}
-                  </Table.Td>
-                </Table.Tr>
-              ))}
-            </Table.Tbody>
-          </Table>
-
-          <Group justify="flex-end">
-            <Button variant="default" onClick={onReallocationSkip}>
-              Manter Tudo Original
-            </Button>
-            <Button color="yellow" onClick={onReallocationComplete}>
-              Aplicar Realocações Selecionadas
-            </Button>
-          </Group>
-        </Stack>
-      </Modal>
     </div>
   );
 }

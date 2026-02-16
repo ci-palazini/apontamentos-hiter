@@ -24,6 +24,7 @@ type Centro = {
   escopo: 'usinagem' | 'montagem';
   centro_pai_id: number | null;
   exibir_filhos: boolean;
+  turnos_op: number;
 };
 
 type Meta = { id: number; centro_id: number; meta_horas: number; vigente_desde: string; vigente_ate: string | null };
@@ -78,6 +79,7 @@ export default function ConfigGeralPage() {
         escopo: r.escopo === 'montagem' ? 'montagem' : 'usinagem',
         centro_pai_id: r.centro_pai_id ? Number(r.centro_pai_id) : null,
         exibir_filhos: Boolean(r.exibir_filhos),
+        turnos_op: Number(r.turnos_op || 1)
       })));
       setMetas((metasRes.data ?? []).map((r: any) => ({ ...r, id: Number(r.id), centro_id: Number(r.centro_id), meta_horas: Number(r.meta_horas) })));
       setAliases(aliasesRes);
@@ -150,6 +152,7 @@ export default function ConfigGeralPage() {
       escopo: centroEditando.escopo,
       centro_pai_id: centroEditando.centro_pai_id,
       exibir_filhos: centroEditando.exibir_filhos,
+      turnos_op: centroEditando.turnos_op
     }).eq('id', centroEditando.id);
     closeModal();
     loadAll();
@@ -370,6 +373,16 @@ export default function ConfigGeralPage() {
                   data={[{ label: 'Usinagem', value: 'usinagem' }, { label: 'Montagem', value: 'montagem' }]}
                   fullWidth
                 />
+
+                <NumberInput
+                  label="Turnos de Operação"
+                  description="Quantos turnos esta máquina opera (1, 2 ou 3). Afeta cálculo de meta por turno."
+                  min={1}
+                  max={3}
+                  value={centroEditando.turnos_op}
+                  onChange={(v) => setCentroEditando({ ...centroEditando, turnos_op: Number(v) || 1 })}
+                />
+
                 <Select
                   label="Agrupador (Centro Pai)"
                   placeholder="Nenhum"
