@@ -38,7 +38,7 @@ export async function fetchEstadoAnterior(empresaId: number, dataWip: string) {
         .from('upload_dia_ativo')
         .select('upload_id')
         .eq('data_wip', dataWip)
-        .single();
+        .maybeSingle();
 
     if (!uploadAntigo) return new Map<number, { horas: number; ref: string }>();
 

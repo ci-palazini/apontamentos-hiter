@@ -27,21 +27,38 @@ import {
   type FuncionarioMeta
   // type FuncionarioCentro removed
 } from '../../services/funcionarios';
-import LinkResolutionModal, { type MissingUser, type MissingLink } from './LinkResolutionModal';
+import LinkResolutionModal, {
+  type MatriculaPendente,
+  type MatriculaDistribuir,
+  type ConfirmedPendente,
+  type ConfirmedDistribuicao,
+} from './LinkResolutionModal';
 
 /* ==========================
    Tipos Locais
 ========================== */
 type Centro = { id: number; codigo: string; ativo?: boolean | null; desativado_desde?: string | null };
-type Alias = { alias_texto: string; centro_id: number };
 
+/** Linha final resolvida, sempre com centro_id e matricula preenchidos */
 type ParsedRow = {
-  data_wip: string;        // 'YYYY-MM-DD'
-  categoria_raw: string;
-  centro_id: number;
+  data_wip: string;       // 'YYYY-MM-DD'
+  centro_id: number;      // sempre resolvido via DB
   aliquota_horas: number;
-  tipo_raw?: string | null;
-  matricula: string;       // AGORA OBRIGATÓRIO
+  matricula: string;      // sempre presente
+};
+
+/** Linha bruta extraída do Excel (antes de resolver máquinas) */
+type ParsedRowSimple = {
+  data_wip: string;
+  aliquota_horas: number;
+  matricula: string;
+  excelRow: number;
+};
+
+/** Linha ignorada com motivo */
+type IgnoredRow = {
+  excelRow: number;
+  reason: string;
 };
 
 type UploadError = { tipo: 'sheet' | 'header' | 'row' | 'meta' | 'persist'; mensagem: string };
@@ -49,10 +66,8 @@ type UploadError = { tipo: 'sheet' | 'header' | 'row' | 'meta' | 'persist'; mens
 // Dados pendentes entre etapas do upload
 type PendingUpload = {
   file: File;
-  rows: ParsedRow[];
-  groups: Map<string, ParsedRow[]>;
-  mapping: { centrosById: Map<number, Centro>; aliasIndex: Map<string, number> };
-  avisos: string[];
+  autoResolvedRows: ParsedRow[];
+  ignoredRows: IgnoredRow[];
 };
 
 /* ==========================
@@ -86,14 +101,6 @@ function detectCol(columns: string[], targets: string[]): string | null {
     if (idx >= 0) return rawCols[idx];
   }
   return null;
-}
-
-function keyize(s: string): string {
-  return String(s)
-    .normalize('NFD')
-    .replace(/[\u0300-\u036f]/g, '')
-    .toLowerCase()
-    .replace(/[^a-z0-9]+/g, '');
 }
 
 function groupByDate<T extends { data_wip: string }>(rows: T[]) {
@@ -155,13 +162,12 @@ export default function UploadPage() {
   const [loadingUploads, setLoadingUploads] = useState(false);
   const nav = useNavigate();
 
-  // --- Estados dos modais de pré-processamento ---
+  // --- Estados do fluxo de upload ---
   const [pendingUpload, setPendingUpload] = useState<PendingUpload | null>(null);
-
-  // Modal 1: Resolução de Vínculos (Substitui Registration e Reallocation)
   const [showLinkModal, setShowLinkModal] = useState(false);
-  const [missingUsers, setMissingUsers] = useState<MissingUser[]>([]);
-  const [missingLinks, setMissingLinks] = useState<MissingLink[]>([]);
+  const [modalPendentes, setModalPendentes] = useState<MatriculaPendente[]>([]);
+  const [modalDistribuicoes, setModalDistribuicoes] = useState<MatriculaDistribuir[]>([]);
+  const [ignoredRows, setIgnoredRows] = useState<IgnoredRow[]>([]);
 
   const pushLog = (s: string) => setLog((prev) => [...prev, s]);
 
@@ -243,33 +249,18 @@ export default function UploadPage() {
     return data ?? [];
   };
 
-  const fetchAlias = async (): Promise<Alias[]> => {
-    const { data, error } = await supabase.from('centro_aliases').select('alias_texto, centro_id');
-    if (error) throw error;
-    return data ?? [];
-  };
-
   const isAtivoNoDia = (c: Centro, dataISO: string) => {
     const flagAtivo = c.ativo ?? true;
     const corte = c.desativado_desde ?? null;
     return flagAtivo && (!corte || dataISO < corte);
   };
 
-  const carregarMapeamento = async () => {
+  /** Carrega centros ativos da empresa e devolve map por id + lista plana */
+  const carregarCentros = async () => {
     const centros = await fetchSupabaseCentros();
-    const aliases = await fetchAlias();
-
     const centrosById = new Map<number, Centro>();
     for (const c of centros) centrosById.set(c.id, c);
-
-    const aliasIndex = new Map<string, number>();
-    for (const a of aliases) {
-      const k1 = keyize(a.alias_texto);
-      const k2 = k1.replace(/^ce/, '');
-      aliasIndex.set(k1, a.centro_id);
-      aliasIndex.set(k2, a.centro_id);
-    }
-    return { centrosById, aliasIndex };
+    return { centrosById, centros };
   };
 
   const carregarTotaisDoDiaCount = async (dataISO: string) => {
@@ -305,8 +296,7 @@ export default function UploadPage() {
     }>();
 
     for (const r of rows) {
-      // IMPORTANTE: Agora só consideramos linhas com matrícula válida e vinculada!
-      // (Isso já foi garantido na validação anterior)
+      // centro_id e matricula são sempre preenchidos nesta etapa
       const key = `${r.data_wip}|${r.centro_id}`;
       const cur = agg.get(key) ?? {
         data_wip: r.data_wip,
@@ -359,7 +349,6 @@ export default function UploadPage() {
     }>();
 
     for (const r of rows) {
-      // Como matricula agora é obrigatória, não precisamos checar se existe
       const key = `${r.data_wip}|${r.centro_id}|${r.matricula}`;
       const cur = aggFunc.get(key) ?? {
         data_wip: r.data_wip,
@@ -415,109 +404,72 @@ export default function UploadPage() {
 
   /* ==========================
      Normalização das linhas
+     Lê apenas matrícula + alíquota + data; ignora coluna de máquina.
   ========================== */
-  const normalizarLinhas = async (
-    sheetRows: any[],
-    mapping: { centrosById: Map<number, Centro>; aliasIndex: Map<string, number> },
-  ) => {
+  const normalizarLinhas = async (sheetRows: any[]) => {
     const headers = Object.keys(sheetRows[0] ?? {}).map((k) => k.trim());
 
     const colData = detectCol(headers, ['data', 'data wip', 'wip', 'data do wip', 'mes', 'mês']);
-    const colCategoria = detectCol(headers, ['categoria', 'centro', 'grupo', 'maquina', 'máquina', 'equipamento']);
     const colAliquota = detectCol(headers, [
       'aliquota', 'alíquota', 'aliquota h', 'alíquota h',
       'aliquota horas', 'alíquota horas',
       'total horas', 'horas totais', 'qtd horas', 'quantidade de horas', 'total h'
     ]);
-    const colTipo = detectCol(headers, ['tipo', 'origem']);
     const colFuncionario = detectCol(headers, ['funcionario', 'funcionário', 'matricula', 'matrícula', 'colaborador']);
 
-    if (!colData || !colCategoria || !colAliquota || !colFuncionario) {
+    if (!colData || !colAliquota || !colFuncionario) {
       const missing = [
         !colData ? 'Data WIP' : null,
-        !colCategoria ? 'Categoria' : null,
-        !colAliquota ? 'Alíquota' : null,
+        !colAliquota ? 'Alíquota/Horas' : null,
         !colFuncionario ? 'Matrícula/Funcionário' : null,
       ].filter(Boolean).join(', ');
       throw { tipo: 'header', mensagem: `Colunas obrigatórias ausentes: ${missing}.` } as UploadError;
     }
 
-    const rows: ParsedRow[] = [];
-    const erros: UploadError[] = [];
-    const avisos: string[] = [];
+    const simpleRows: ParsedRowSimple[] = [];
+    const ignoradas: IgnoredRow[] = [];
 
     for (let idx = 0; idx < sheetRows.length; idx += 1) {
       const raw = sheetRows[idx];
       const excelRow = idx + 2;
 
+      // Pula linhas totalmente vazias
+      const soVazios = Object.values(raw).every((v) => v == null || String(v).trim() === '');
+      if (soVazios) continue;
+
+      // Pula linhas de totais (ex: rodapé da planilha)
+      const linhaTexto = Object.values(raw).map((v) => String(v ?? '').toLowerCase()).join(' ');
+
       const dataWip = parseWipISO(raw[colData]);
       if (!dataWip) {
-        // ... (ignorando linhas de total/vazias como antes)
-        const linhaTexto = Object.values(raw).map((v) => String(v ?? '').toLowerCase()).join(' ');
         if (linhaTexto.includes('total')) continue;
-        const soVazios = Object.values(raw).every((v) => {
-          if (v == null) return true;
-          const s = String(v).trim();
-          return s === '';
-        });
-        if (soVazios) continue;
-        erros.push({ tipo: 'row', mensagem: `Linha ${excelRow}: Data WIP inválida (${raw[colData]}).` });
+        ignoradas.push({ excelRow, reason: `Data WIP inválida "${raw[colData]}"` });
         continue;
       }
 
-      const categoriaRaw = String(raw[colCategoria] ?? '').trim();
-      if (!categoriaRaw) {
-        erros.push({ tipo: 'row', mensagem: `Linha ${excelRow}: Categoria vazia.` });
-        continue;
-      }
-
-      const k1 = keyize(categoriaRaw);
-      const k2 = k1.replace(/^ce/, '');
-      const centroId = mapping.aliasIndex.get(k1) ?? mapping.aliasIndex.get(k2) ?? null;
-
-      if (centroId == null) {
-        // Se não achou centro, ignora (ou avisa)
-        continue;
-      }
-
-      const centro = mapping.centrosById.get(centroId);
-      if (!centro) continue;
-      if (!isAtivoNoDia(centro, dataWip)) continue;
-
-      const aliParsed = parsePtBrNumber(raw[colAliquota]);
-      if (!isFiniteNumber(aliParsed)) {
-        erros.push({ tipo: 'row', mensagem: `Linha ${excelRow}: Alíquota inválida (${raw[colAliquota]}).` });
-        continue;
-      }
-      const aliquota = +aliParsed.toFixed(4);
-      const tipoRaw = colTipo ? (String(raw[colTipo] ?? '').trim() || null) : null;
-
-      // --- VALIDAÇÃO DA MATRÍCULA ---
       const rawF = String(raw[colFuncionario] ?? '').trim();
       const onlyDigits = (rawF.match(/\d+/)?.[0] ?? '').slice(0, 8);
-      const matricula = onlyDigits && onlyDigits.length >= 3 ? onlyDigits : null;
-
+      const matricula = onlyDigits && onlyDigits.length >= 1 ? onlyDigits : null;
       if (!matricula) {
-        erros.push({ type: 'row', mensagem: `Linha ${excelRow}: Matrícula inválida ou ausente.` } as any);
+        ignoradas.push({ excelRow, reason: `Matrícula inválida ou ausente "${raw[colFuncionario]}"` });
         continue;
       }
 
-      rows.push({
+      const aliParsed = parsePtBrNumber(raw[colAliquota]);
+      if (!isFiniteNumber(aliParsed) || aliParsed <= 0) {
+        ignoradas.push({ excelRow, reason: `Alíquota inválida ou zero "${raw[colAliquota]}"` });
+        continue;
+      }
+
+      simpleRows.push({
         data_wip: dataWip,
-        categoria_raw: categoriaRaw,
-        centro_id: centro.id,
-        aliquota_horas: aliquota,
-        tipo_raw: tipoRaw,
+        aliquota_horas: +aliParsed.toFixed(4),
         matricula,
+        excelRow,
       });
     }
 
-    if (erros.length) {
-      const mensagem = erros.map((e) => e.mensagem).join('\n');
-      throw { tipo: 'row', mensagem } as UploadError;
-    }
-
-    return { rows, avisos };
+    return { simpleRows, ignoradas };
   };
 
   /* ==========================
@@ -540,101 +492,114 @@ export default function UploadPage() {
       const json = XLSX.utils.sheet_to_json(sheet, { defval: null });
       if (!json.length) throw { tipo: 'sheet', mensagem: 'Planilha vazia.' } as UploadError;
 
-      pushLog('Carregando mapeamentos de centros...');
-      const mapping = await carregarMapeamento();
+      pushLog('Normalizando linhas (coluna de máquina ignorada — resolvendo via vínculos)...');
+      const { simpleRows, ignoradas } = await normalizarLinhas(json);
 
-      pushLog('Normalizando linhas (Matrículas Obrigatórias)...');
-      const { rows, avisos } = await normalizarLinhas(json, mapping);
-      if (avisos.length) avisos.forEach((m) => pushLog(`Aviso: ${m}`));
-      if (!rows.length) throw { tipo: 'row', mensagem: 'Nenhuma linha válida após normalização.' } as UploadError;
+      if (ignoradas.length) {
+        pushLog(`Linhas ignoradas: ${ignoradas.length}`);
+        ignoradas.forEach(r => pushLog(`  Linha ${r.excelRow}: ${r.reason}`));
+      }
+      setIgnoredRows(ignoradas);
 
-      const groups = groupByDate(rows);
-      pushLog(`Detectadas ${groups.size} data(s): ${[...groups.keys()].join(', ')}`);
+      if (!simpleRows.length) throw { tipo: 'row', mensagem: 'Nenhuma linha válida após normalização (verifique colunas de Data, Alíquota e Matrícula).' } as UploadError;
 
-      // ===============================================
-      // NOVA VALIDAÇÃO DE VÍNCULOS
-      // ===============================================
-      pushLog('Validando vínculos Matrícula ↔ Máquina...');
-
-      // 1. Coletar pares únicos (matricula, centro_id) do arquivo
-      const paresNoArquivo = new Map<string, Set<number>>();
-      rows.forEach(r => {
-        const s = paresNoArquivo.get(r.matricula) ?? new Set();
-        s.add(r.centro_id);
-        paresNoArquivo.set(r.matricula, s);
-      });
-
-      // 2. Fetch dados existentes
-      const [metas, vinculos] = await Promise.all([
+      // ==========================================================
+      // NOVA LÓGICA: Resolver máquinas 100% via vínculos no banco
+      // ==========================================================
+      pushLog('Carregando centros e vínculos de funcionários...');
+      const [{ centrosById, centros }, metas, vinculos] = await Promise.all([
+        carregarCentros(),
         fetchFuncionariosMeta(empresaId),
         fetchFuncionarioCentros(empresaId),
       ]);
 
+      const centrosList = centros.map(c => ({ id: c.id, codigo: c.codigo }));
+
       const metaByMatricula = new Map<string, FuncionarioMeta>();
       metas.forEach(m => metaByMatricula.set(m.matricula, m));
 
-      // Mapa: Matricula -> Set de CentroIDs vinculados
-      const existingLinks = new Map<string, Set<number>>();
-      vinculos.forEach(v => {
-        const m = metas.find(meta => meta.id === v.funcionario_meta_id);
-        if (m) {
-          const s = existingLinks.get(m.matricula) ?? new Set();
-          s.add(v.centro_id);
-          existingLinks.set(m.matricula, s);
+      // funcionario_meta_id → [centro_ids]
+      const linksByMetaId = new Map<number, number[]>();
+      for (const v of vinculos) {
+        const arr = linksByMetaId.get(v.funcionario_meta_id) ?? [];
+        arr.push(v.centro_id);
+        linksByMetaId.set(v.funcionario_meta_id, arr);
+      }
+
+      // Agrega horas por (matricula, data_wip)
+      const aggMap = new Map<string, { matricula: string; data_wip: string; totalHoras: number }>();
+      for (const r of simpleRows) {
+        const key = `${r.matricula}|${r.data_wip}`;
+        const cur = aggMap.get(key) ?? { matricula: r.matricula, data_wip: r.data_wip, totalHoras: 0 };
+        cur.totalHoras += r.aliquota_horas;
+        aggMap.set(key, cur);
+      }
+
+      const datas = [...new Set(simpleRows.map(r => r.data_wip))];
+      pushLog(`Detectadas ${datas.length} data(s): ${datas.join(', ')}`);
+      pushLog(`Matrículas únicas: ${aggMap.size}`);
+
+      // Classifica cada (matricula, data_wip)
+      const autoResolvedRows: ParsedRow[] = [];
+      const pendentes: MatriculaPendente[] = [];
+      const paraDistribuir: MatriculaDistribuir[] = [];
+
+      for (const { matricula, data_wip, totalHoras } of aggMap.values()) {
+        const meta = metaByMatricula.get(matricula);
+
+        if (!meta) {
+          // Caso A: matrícula inexistente → cadastrar + selecionar máquinas
+          pushLog(`  [A] ${matricula} (${data_wip}): matrícula não encontrada no banco → cadastrar`);
+          pendentes.push({ matricula, nome: '', data_wip, totalHoras: +totalHoras.toFixed(4), mustCreateUser: true, availableCentros: centrosList });
+          continue;
         }
-      });
 
-      const mUsers: MissingUser[] = [];
-      const mLinks: MissingLink[] = [];
+        const allLinkedIds = linksByMetaId.get(meta.id) ?? [];
+        // Filtra apenas centros ativos no dia
+        const activeIds = allLinkedIds.filter(id => {
+          const c = centrosById.get(id);
+          return c ? isAtivoNoDia(c, data_wip) : false;
+        });
 
-      // 3. Verificar cada par do arquivo
-      for (const [matricula, centroIds] of paresNoArquivo.entries()) {
-        const userExists = metaByMatricula.has(matricula);
+        const allCodes = allLinkedIds.map(id => centrosById.get(id)?.codigo ?? `ID ${id}`);
+        const activeCodes = activeIds.map(id => centrosById.get(id)?.codigo ?? `ID ${id}`);
 
-        if (!userExists) {
-          // Usuário inexistente -> Vai ser criado e já vinculado a TODAS as máquinas que apareceram pra ele
-          mUsers.push({
-            matricula,
-            nome: '', // será preenchido
-            machineIds: [...centroIds],
-            machineCodes: [...centroIds].map(id => mapping.centrosById.get(id)?.codigo || `ID ${id}`)
-          });
+        if (activeIds.length === 0) {
+          // Caso B: existe mas sem vínculo ativo → selecionar máquinas
+          const detail = allLinkedIds.length === 0
+            ? 'sem vínculos cadastrados'
+            : `vínculos [${allCodes.join(', ')}] inativos na data`;
+          pushLog(`  [B] ${matricula} (${data_wip}): ${detail} → selecionar máquina`);
+          pendentes.push({ matricula, nome: meta.nome, data_wip, totalHoras: +totalHoras.toFixed(4), mustCreateUser: false, availableCentros: centrosList });
+        } else if (activeIds.length === 1) {
+          // Caso C: 1 máquina ativa → auto-resolve
+          pushLog(`  [C] ${matricula} (${data_wip}): auto-resolvido → ${activeCodes[0]}`);
+          autoResolvedRows.push({ data_wip, centro_id: activeIds[0], aliquota_horas: +totalHoras.toFixed(4), matricula });
         } else {
-          // Usuário existe -> Checar se tem vinculo
-          const linkedIds = existingLinks.get(matricula) ?? new Set();
-          const missingForThisUser: number[] = [];
-
-          centroIds.forEach(cid => {
-            if (!linkedIds.has(cid)) {
-              missingForThisUser.push(cid);
-            }
+          // Caso D: múltiplas máquinas → distribuição manual
+          pushLog(`  [D] ${matricula} (${data_wip}): ${activeIds.length} máquinas ativas [${activeCodes.join(', ')}] → distribuir`);
+          paraDistribuir.push({
+            matricula, nome: meta.nome, data_wip, totalHoras: +totalHoras.toFixed(4),
+            machineIds: activeIds,
+            machineCodes: activeCodes,
           });
-
-          if (missingForThisUser.length > 0) {
-            mLinks.push({
-              matricula,
-              nome: metaByMatricula.get(matricula)?.nome || 'Desconhecido',
-              machineIds: missingForThisUser,
-              machineCodes: missingForThisUser.map(id => mapping.centrosById.get(id)?.codigo || `ID ${id}`)
-            });
-          }
         }
       }
 
-      if (mUsers.length > 0 || mLinks.length > 0) {
-        pushLog(`⚠️ Atenção: ${mUsers.length} novo(s) funcionário(s) e ${mLinks.length} vínculo(s) ausente(s).`);
-        pushLog('Aguardando resolução pelo usuário...');
+      pushLog(`Auto-resolvidas: ${autoResolvedRows.length} · Para cadastrar/vincular: ${pendentes.length} · Para distribuir: ${paraDistribuir.length}`);
 
-        setPendingUpload({ file, rows, groups, mapping, avisos: [] });
-        setMissingUsers(mUsers);
-        setMissingLinks(mLinks);
+      if (pendentes.length > 0 || paraDistribuir.length > 0) {
+        pushLog('⚠️ Aguardando resolução pelo operador...');
+        setPendingUpload({ file, autoResolvedRows, ignoredRows: ignoradas });
+        setModalPendentes(pendentes);
+        setModalDistribuicoes(paraDistribuir);
         setShowLinkModal(true);
         setBusy(false);
-        return; // PAUSA AQUI
+        return;
       }
 
-      // Se tudo OK, persiste direto
-      await etapa3Persistir(file, rows, groups);
+      // Tudo resolvido automaticamente
+      await etapa3Persistir(file, autoResolvedRows, groupByDate(autoResolvedRows));
 
     } catch (err: any) {
       console.error(err);
@@ -648,64 +613,77 @@ export default function UploadPage() {
 
 
   /* ==========================
-     Callback e Continuação
+     Callback do modal de resolução
   ========================== */
   const handleLinkResolutionConfirm = async (
-    newUsers: { matricula: string; nome: string; centroIds: number[]; turno: number }[],
-    newLinks: { matricula: string; centroIds: number[] }[]
+    confirmedPendentes: ConfirmedPendente[],
+    confirmedDistribuicoes: ConfirmedDistribuicao[]
   ) => {
     setShowLinkModal(false);
     setBusy(true);
 
     try {
-      pushLog(`Criando ${newUsers.length} usuários e ${newLinks.length} conjuntos de vínculos...`);
+      const novos = confirmedPendentes.filter(p => p.isNewUser);
+      const vincular = confirmedPendentes.filter(p => !p.isNewUser);
+      pushLog(`Cadastrando ${novos.length} novo(s) funcionário(s) e ${vincular.length} vínculo(s)...`);
 
-      // 1. Criar Usuários
-      for (const u of newUsers) {
-        // Cria Meta
+      // 1. Criar usuários novos
+      for (const cp of novos) {
         await upsertFuncionarioMeta(empresaId, {
-          matricula: u.matricula,
-          nome: u.nome,
-          meta_diaria_horas: 0, // default
-          turno: u.turno
-          // area: null 
+          matricula: cp.matricula,
+          nome: cp.nome,
+          meta_diaria_horas: 0,
+          turno: cp.turno,
         });
-
-        // Precisamos do ID gerado para vincular
-        // (Como upsertFuncionarioMeta não retorna ID diretamente e é void, vamos buscar novamente.
-        //  Poderíamos otimizar, mas a API atual é assim)
-        const [func] = (await fetchFuncionariosMeta(empresaId)).filter(f => f.matricula === u.matricula);
-
+        const metasAtual = await fetchFuncionariosMeta(empresaId);
+        const func = metasAtual.find(f => f.matricula === cp.matricula);
         if (func) {
-          for (const cid of u.centroIds) {
-            await addFuncionarioCentro(empresaId, func.id, cid);
+          for (const { centroId } of cp.centroHoras) {
+            await addFuncionarioCentro(empresaId, func.id, centroId).catch(() => {});
           }
         }
       }
 
-      // 2. Criar Vínculos (para usuários já existentes)
-      const metas = await fetchFuncionariosMeta(empresaId);
-      for (const l of newLinks) {
-        const func = metas.find(f => f.matricula === l.matricula);
-        if (func) {
-          for (const cid of l.centroIds) {
-            // Evitar duplicação se rodar 2x (addFuncionarioCentro não tem onConflict ignore fácil, 
-            // mas supomos que o modal filtrou o que faltava)
-            await addFuncionarioCentro(empresaId, func.id, cid).catch(() => { });
+      // 2. Vincular máquinas para usuários existentes sem vínculo
+      if (vincular.length > 0) {
+        const metasAtual = await fetchFuncionariosMeta(empresaId);
+        for (const cp of vincular) {
+          const func = metasAtual.find(f => f.matricula === cp.matricula);
+          if (func) {
+            for (const { centroId } of cp.centroHoras) {
+              await addFuncionarioCentro(empresaId, func.id, centroId).catch(() => {});
+            }
           }
         }
       }
 
-      pushLog('Vínculos atualizados com sucesso.');
+      pushLog('Vínculos atualizados.');
 
-      // Retomar persistência
-      if (pendingUpload) {
-        await etapa3Persistir(pendingUpload.file, pendingUpload.rows, pendingUpload.groups);
+      // 3. Montar linhas finais: auto-resolvidas + modal
+      const finalRows: ParsedRow[] = [...(pendingUpload?.autoResolvedRows ?? [])];
+
+      for (const cp of confirmedPendentes) {
+        for (const { centroId, horas } of cp.centroHoras) {
+          if (horas > 0) finalRows.push({ data_wip: cp.data_wip, centro_id: centroId, aliquota_horas: +horas.toFixed(4), matricula: cp.matricula });
+        }
       }
+      for (const cd of confirmedDistribuicoes) {
+        for (const { centroId, horas } of cd.centroHoras) {
+          if (horas > 0) finalRows.push({ data_wip: cd.data_wip, centro_id: centroId, aliquota_horas: +horas.toFixed(4), matricula: cd.matricula });
+        }
+      }
+
+      if (!pendingUpload || !finalRows.length) {
+        pushLog('Nenhuma linha para persistir.');
+        setBusy(false);
+        return;
+      }
+
+      await etapa3Persistir(pendingUpload.file, finalRows, groupByDate(finalRows));
 
     } catch (err: any) {
       console.error(err);
-      const mensagem = err?.message || 'Erro ao criar vínculos.';
+      const mensagem = err?.message || 'Erro ao processar vínculos.';
       pushLog(`Erro: ${mensagem}`);
       notifications.show({ title: 'Erro', message: mensagem, color: 'red' });
       setBusy(false);
@@ -773,8 +751,10 @@ export default function UploadPage() {
     <div style={{ padding: '24px 32px' }}>
       <Title order={2} mb="sm">Metas - Upload</Title>
       <Text c="dimmed" mb="lg">
-        Envie o .xlsx. O sistema detecta automaticamente se as horas da máquina mudaram em relação ao último upload.
-        <br />Se não mudaram, a <b>referência de tempo</b> da máquina será mantida (badge laranja na TV).
+        Envie o .xlsx. O sistema lê a <b>matrícula</b> e consulta as máquinas vinculadas no banco —
+        a coluna de máquina da planilha é ignorada. Se uma matrícula tiver múltiplas máquinas ou não
+        estiver cadastrada, será solicitada a distribuição manual antes de salvar.
+        <br />Se as horas de uma máquina não mudaram em relação ao upload anterior, a <b>referência de tempo</b> é mantida (badge laranja na TV).
       </Text>
 
       <Grid gutter="lg">
@@ -952,6 +932,27 @@ export default function UploadPage() {
           </Card>
         </Grid.Col>
 
+      {/* Linhas Ignoradas */}
+        {ignoredRows.length > 0 && (
+          <Grid.Col span={12}>
+            <Card withBorder shadow="sm" radius="lg" p="md">
+              <Group justify="space-between" mb="xs">
+                <Title order={6} style={{ opacity: 0.9, letterSpacing: 0.3 }}>
+                  Linhas Ignoradas no Último Upload
+                </Title>
+                <Badge color="orange" variant="light">{ignoredRows.length} linha{ignoredRows.length !== 1 ? 's' : ''}</Badge>
+              </Group>
+              <div style={{ maxHeight: 160, overflowY: 'auto' }}>
+                {ignoredRows.map((r) => (
+                  <Text key={r.excelRow} size="xs" c="dimmed" style={{ fontFamily: 'monospace' }}>
+                    Linha {r.excelRow}: {r.reason}
+                  </Text>
+                ))}
+              </div>
+            </Card>
+          </Grid.Col>
+        )}
+
         <Grid.Col span={12}>
           <Card withBorder shadow="sm" radius="lg" p="md">
             <Title order={6} style={{ opacity: 0.9, letterSpacing: 0.3 }} mb="xs">Log</Title>
@@ -964,17 +965,17 @@ export default function UploadPage() {
         </Grid.Col>
       </Grid>
 
-      {/* Novo Modal de Resolução de Vínculos */}
+      {/* Modal de resolução de vínculos / distribuição de horas */}
       <LinkResolutionModal
         opened={showLinkModal}
         onClose={() => {
           setShowLinkModal(false);
-          setPendingUpload(null); // Cancelar upload
+          setPendingUpload(null);
           pushLog('Upload cancelado pelo usuário.');
         }}
         onConfirm={handleLinkResolutionConfirm}
-        missingUsers={missingUsers}
-        missingLinks={missingLinks}
+        pendentes={modalPendentes}
+        paraDistribuir={modalDistribuicoes}
       />
 
     </div>
