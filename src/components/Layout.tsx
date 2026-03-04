@@ -1,7 +1,8 @@
 ﻿// src/components/Layout.tsx
 import type { ReactNode } from 'react';
 import { Link, useLocation, Outlet, useNavigate } from 'react-router-dom';
-import { AppShell, NavLink, Group, Text, Image, Badge, Tooltip } from '@mantine/core';
+import { AppShell, NavLink, Group, Text, Image, Badge, Tooltip, Burger } from '@mantine/core';
+import { useDisclosure } from '@mantine/hooks';
 import {
   IconCalendarTime,
   IconChartHistogram,
@@ -79,12 +80,17 @@ export default function Layout() {
   const { pathname } = useLocation();
   const navigate = useNavigate();
   const { empresa } = useTenant();
+  const [opened, { toggle, close }] = useDisclosure();
 
   const isActive = (to: string, exact?: boolean) =>
     exact ? pathname === to : pathname === to || pathname.startsWith(`${to}/`);
 
   return (
-    <AppShell header={{ height: 56 }} navbar={{ width: 232, breakpoint: 'sm' }} padding="md">
+    <AppShell
+      header={{ height: 56 }}
+      navbar={{ width: 232, breakpoint: 'sm', collapsed: { mobile: !opened } }}
+      padding="md"
+    >
       {/* HEADER */}
       <AppShell.Header
         withBorder
@@ -94,9 +100,13 @@ export default function Layout() {
         }}
       >
         <Group h="100%" px="md" justify="space-between">
-          <Link to="/" style={{ textDecoration: 'none', color: 'inherit' }}>
-            <Brand />
-          </Link>
+          <Group gap="sm">
+            {/* Burger visível só em mobile (sm breakpoint) */}
+            <Burger opened={opened} onClick={toggle} hiddenFrom="sm" size="sm" />
+            <Link to="/" style={{ textDecoration: 'none', color: 'inherit' }}>
+              <Brand />
+            </Link>
+          </Group>
           <Group gap="xs">
             <Tooltip label="Trocar empresa">
               <Badge
@@ -133,6 +143,7 @@ export default function Layout() {
                 variant="light"
                 style={{ borderRadius: 10, marginBottom: 6 }}
                 styles={{ label: { fontWeight: 600 } }}
+                onClick={close}  // fecha o menu ao clicar num link no mobile
               />
             ))}
         </nav>
