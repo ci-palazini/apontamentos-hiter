@@ -1,9 +1,10 @@
 // src/features/funcionario/RendFuncionarioPage.tsx
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import {
     Group, Title, Text, Table, Loader, Badge, rem, Stack,
-    Paper, ThemeIcon, SimpleGrid,
+    Paper, ThemeIcon, SimpleGrid, Button,
 } from '@mantine/core';
+import { toPng } from 'html-to-image';
 import { DatePickerInput } from '@mantine/dates';
 import { useEmpresaId } from '../../contexts/TenantContext';
 import {
@@ -22,6 +23,7 @@ import {
     IconTarget,
     IconChartBar,
     IconCalendarStats,
+    IconDownload,
 } from '@tabler/icons-react';
 
 /* ============================================================
@@ -158,10 +160,37 @@ export default function RendimentoPage() {
 
     const [dia, setDia] = useState<Date | null>(new Date());
     const [loading, setLoading] = useState(true);
+    const [exporting, setExporting] = useState(false);
 
     const [metas, setMetas] = useState<FuncionarioMeta[]>([]);
     const [dadosDia, setDadosDia] = useState<FuncionarioDia[]>([]);
     const [dadosMes, setDadosMes] = useState<FuncionarioMes[]>([]);
+
+    const tableRef = useRef<HTMLDivElement>(null);
+
+    async function exportPNG() {
+        if (!tableRef.current) return;
+        setExporting(true);
+        try {
+            const target = tableRef.current;
+            const dataUrl = await toPng(target, {
+                pixelRatio: 2,
+                backgroundColor: '#ffffff',
+                // Capture the full scrollable width, not just the visible area
+                width: target.scrollWidth,
+                height: target.scrollHeight,
+                style: { overflow: 'visible' },
+            });
+            const link = document.createElement('a');
+            const d = dia ?? new Date();
+            const dateStr = `${String(d.getDate()).padStart(2, '0')}-${String(d.getMonth() + 1).padStart(2, '0')}-${d.getFullYear()}`;
+            link.download = `rendimento_${dateStr}.png`;
+            link.href = dataUrl;
+            link.click();
+        } finally {
+            setExporting(false);
+        }
+    }
 
     /* ---- Carga inicial: detectar último dia com dados ---- */
     useEffect(() => {
@@ -357,6 +386,16 @@ export default function RendimentoPage() {
                         <Text size="sm" c="dimmed">Rendimento individual por funcionário</Text>
                     </div>
                 </Group>
+                <Button
+                    leftSection={<IconDownload size={16} />}
+                    variant="light"
+                    size="sm"
+                    onClick={exportPNG}
+                    loading={exporting}
+                    disabled={loading || groups.length === 0}
+                >
+                    Exportar PNG
+                </Button>
             </Group>
 
             {/* ========== KPI Cards + Date Filter ========== */}
@@ -447,7 +486,7 @@ export default function RendimentoPage() {
                     <Text c="dimmed" size="sm" mt={4}>Configure funcionários em Configurações → Funcionários.</Text>
                 </Paper>
             ) : (
-                <Paper shadow="sm" radius="lg" style={{ ...glassCard, overflow: 'hidden' }}>
+                <Paper ref={tableRef} shadow="sm" radius="lg" style={{ ...glassCard, overflow: 'hidden' }}>
                     <div style={{ overflowX: 'auto' }}>
                         <Table
                             highlightOnHover
