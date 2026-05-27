@@ -1,7 +1,7 @@
 ﻿// src/components/Layout.tsx
 import type { ReactNode } from 'react';
-import { Link, useLocation, Outlet, useNavigate } from 'react-router-dom';
-import { AppShell, NavLink, Group, Text, Image, Badge, Tooltip, Burger } from '@mantine/core';
+import { Link, useLocation, Outlet } from 'react-router-dom';
+import { AppShell, NavLink, Group, Text, Image, Badge, Burger } from '@mantine/core';
 import { useDisclosure } from '@mantine/hooks';
 import {
   IconCalendarTime,
@@ -11,9 +11,7 @@ import {
   IconGauge,
   IconDeviceTv,
   IconSpeakerphone,
-  IconBuilding,
 } from '@tabler/icons-react';
-import { useTenant } from '../contexts/TenantContext';
 
 function Brand() {
   return (
@@ -27,8 +25,7 @@ type LinkItem = {
   label: string;
   to: string;
   icon: ReactNode;
-  exact?: boolean; // quando false, marca ativo também nas subrotas
-  empresaOnly?: number; // se definido, só aparece para essa empresa
+  exact?: boolean;
 };
 
 const links: LinkItem[] = [
@@ -78,8 +75,6 @@ const links: LinkItem[] = [
 
 export default function Layout() {
   const { pathname } = useLocation();
-  const navigate = useNavigate();
-  const { empresa } = useTenant();
   const [opened, { toggle, close }] = useDisclosure();
 
   const isActive = (to: string, exact?: boolean) =>
@@ -107,32 +102,16 @@ export default function Layout() {
               <Brand />
             </Link>
           </Group>
-          <Group gap="xs">
-            <Tooltip label="Trocar empresa">
-              <Badge
-                variant="light"
-                color="blue"
-                size="lg"
-                leftSection={<IconBuilding size={14} />}
-                style={{ cursor: 'pointer' }}
-                onClick={() => navigate('/empresa')}
-              >
-                {empresa.nome}
-              </Badge>
-            </Tooltip>
-            <Badge variant="light" color="gray">
-              v0.1
-            </Badge>
-          </Group>
+          <Badge variant="light" color="gray">
+            v0.1
+          </Badge>
         </Group>
       </AppShell.Header>
 
       {/* NAVBAR */}
       <AppShell.Navbar p="xs" withBorder>
         <nav>
-          {links
-            .filter((l) => !l.empresaOnly || l.empresaOnly === empresa.id)
-            .map((l) => (
+          {links.map((l) => (
               <NavLink
                 key={l.to}
                 component={Link}

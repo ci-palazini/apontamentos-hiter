@@ -9,15 +9,11 @@ import RendimentoPage from './features/funcionario/RendFuncionarioPage';
 import TvDashboardPage from './features/tv/TvDashboardPage';
 import TvMenuPage from './features/tv/TvMenuPage';
 import AvisosAdminPage from './features/tv/AvisosAdminPage';
-import EmpresaSelectorPage from './features/empresa/EmpresaSelectorPage';
 
 export default function App() {
   return (
     <BrowserRouter>
       <Routes>
-        {/* Página de seleção de empresa */}
-        <Route path="/empresa" element={<EmpresaSelectorPage />} />
-
         {/* Rotas administrativas com Layout */}
         <Route element={<Layout />}>
           <Route index element={<Navigate to="/dia" replace />} />
